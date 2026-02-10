@@ -1,4 +1,4 @@
-# m0nitor Worker
+# m0nitor Agent
 
 This is the distributed worker agent for [m0nitor.com](https://m0nitor.com). It performs availability and performance checks from various locations and reports back to the main console.
 
@@ -17,11 +17,11 @@ Run the worker using the pre-built Docker image.
 
 ```bash
 docker run -d \
-  --name m0nitor-worker \
+  --name m0nitor-agent \
   --restart always \
   -e API_URL="https://console.m0nitor.com/api" \
   -e PROBE_TOKEN="your-probe-token-here" \
-  ghcr.io/your-username/m0nitor-worker:latest
+  ghcr.io/m0nitor-com/agent:latest
 ```
 
 ### Option 2: Docker Compose
@@ -31,8 +31,8 @@ Create a `docker-compose.yml`:
 ```yaml
 version: '3'
 services:
-  worker:
-    image: ghcr.io/your-username/m0nitor-worker:latest
+  agent:
+    image: ghcr.io/m0nitor-com/agent:latest
     restart: always
     environment:
       - API_URL=https://console.m0nitor.com/api
@@ -49,8 +49,8 @@ docker-compose up -d
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-username/m0nitor-worker.git
-   cd m0nitor-worker
+   git clone https://github.com/m0nitor-com/agent.git
+   cd agent
    ```
 
 2. **Install dependencies**:
@@ -78,7 +78,7 @@ All configuration is done via environment variables.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `API_URL` | The base URL of the m0nitor API | **Required** |
-| `PROBE_TOKEN` | The unique authentication token for this worker | **Required** |
+| `PROBE_TOKEN` | The unique authentication token for this agent | **Required** |
 | `LOG_LEVEL` | Logging verbosity (`debug`, `info`, `warn`, `error`) | `info` |
 | `POLL_INTERVAL`| Time between check cycles in milliseconds | `5000` |
 | `SKIP_SSL_VERIFY` | Skip SSL certificate verification (**INSECURE**) | `false` |
@@ -87,12 +87,12 @@ All configuration is done via environment variables.
 
 ## 📦 Deployment / Updates
 
-The worker is designed to be stateless. To update, simply pull the latest Docker image and restart the container.
+The agent is designed to be stateless. To update, simply pull the latest Docker image and restart the container.
 
 ```bash
-docker pull ghcr.io/your-username/m0nitor-worker:latest
-docker stop m0nitor-worker
-docker rm m0nitor-worker
+docker pull ghcr.io/m0nitor-com/agent:latest
+docker stop m0nitor-agent
+docker rm m0nitor-agent
 # Run again with your original command
 ```
 
