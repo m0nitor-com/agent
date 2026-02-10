@@ -12,6 +12,13 @@ const __dirname = dirname(__filename);
 const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'), 'utf8'));
 
 /**
+ * Sleep for a given number of milliseconds
+ */
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
  * API client for communicating with the Laravel backend
  */
 class ApiClient {
@@ -19,6 +26,8 @@ class ApiClient {
         this.baseUrl = baseUrl.replace(/\/$/, '');
         this.token = token;
         this.version = pkg.version;
+        this.maxRetries = 3;
+        this.baseDelay = 1000; // 1 second
 
         // Only skip SSL verification if explicitly enabled (INSECURE)
         const httpsAgent = config.SKIP_SSL_VERIFY
@@ -42,41 +51,54 @@ class ApiClient {
     }
 
     /**
+     * Execute a request with exponential backoff retry
+     */
+    async withRetry(fn, context = 'request') {
+        let lastError;
+
+        for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+            try {
+                return await fn();
+            } catch (error) {
+                lastError = error;
+
+                // Don't retry on auth errors or validation errors
+                const status = error.response?.status;
+                if (status === 401 || status === 403 || status === 422) {
+                    throw error;
+                }
+
+                if (attempt < this.maxRetries) {
+                    const delay = this.baseDelay * Math.pow(2, attempt);
+                    const jitter = delay * (0.5 + Math.random() * 0.5);
+                    logger.warn(`[API] ${context} failed (attempt ${attempt + 1}/${this.maxRetries + 1}), retrying in ${Math.round(jitter)}ms...`);
+                    await sleep(jitter);
+                }
+            }
+        }
+
+        logger.error({ err: lastError }, `[API] ${context} failed after ${this.maxRetries + 1} attempts`);
+        throw lastError;
+    }
+
+    /**
      * Fetch monitors that need to be checked
      */
     async getChecks() {
-        try {
+        return this.withRetry(async () => {
             const response = await this.client.get(`/workers/${this.token}/checks`);
             return response.data;
-        } catch (error) {
-            logger.error({ err: error }, '[API] Failed to fetch checks');
-            throw error;
-        }
+        }, 'getChecks');
     }
 
     /**
      * Report a check result to the backend
      */
     async reportCheck(result) {
-        try {
+        return this.withRetry(async () => {
             const response = await this.client.post(`/workers/${this.token}/report`, result);
             return response.data;
-        } catch (error) {
-            logger.error({ err: error }, '[API] Failed to report check');
-            throw error;
-        }
-    }
-
-    /**
-     * Send a heartbeat to update last_seen
-     */
-    async heartbeat() {
-        try {
-            await this.client.get(`/workers/${this.token}/checks`);
-            logger.debug('[API] Heartbeat sent');
-        } catch (error) {
-            logger.error({ err: error }, '[API] Heartbeat failed');
-        }
+        }, 'reportCheck');
     }
 }
 

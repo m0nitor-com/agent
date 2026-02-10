@@ -9,6 +9,7 @@ import checkUdp from './checks/udp.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import http from 'http';
 
 // Get current version
 const __filename = fileURLToPath(import.meta.url);
@@ -16,12 +17,17 @@ const __dirname = dirname(__filename);
 const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
 const CURRENT_VERSION = pkg.version;
 
-logger.info(`[m0nitor Worker] Starting up v${CURRENT_VERSION}...`);
+logger.info(`[m0nitor Agent] Starting up v${CURRENT_VERSION}...`);
 logger.info(`[CONFIG] API URL: ${config.API_URL}`);
 logger.info(`[CONFIG] Poll Interval: ${config.POLL_INTERVAL}ms`);
 
 // Initialize API client
 const api = new ApiClient(config.API_URL, config.PROBE_TOKEN);
+
+// Health state
+let lastPollSuccess = false;
+let lastPollTime = null;
+let totalChecks = 0;
 
 /**
  * Execute a check based on monitor type
@@ -80,6 +86,9 @@ async function pollAndCheck() {
         // Fetch monitors that need checking
         const data = await api.getChecks();
 
+        lastPollSuccess = true;
+        lastPollTime = new Date();
+
         if (!data.monitors || data.monitors.length === 0) {
             logger.debug('[POLL] No monitors to check');
             return;
@@ -121,6 +130,7 @@ async function pollAndCheck() {
                     const status = result.is_success ? '✓' : '✗';
                     logger.info(`[REPORT] ${status} Monitor #${result.monitor_id}: ${result.response_time_ms || 0}ms`);
                     await api.reportCheck(result);
+                    totalChecks++;
                 } catch (error) {
                     logger.error({ err: error, monitor_id: result.monitor_id }, `[REPORT] Failed to report result`);
                 }
@@ -128,10 +138,9 @@ async function pollAndCheck() {
         }
 
     } catch (error) {
+        lastPollSuccess = false;
         if (error.response?.status === 401) {
             logger.fatal('[ERROR] Invalid or expired probe token');
-            // Don't exit process, just log fatal. Supervisor/Docker should restart if we crashed, but loop should continue if transient.
-            // Actually, if token is invalid, we probably should crash to signal a config error.
             process.exit(1);
         } else {
             logger.error({ err: error }, '[POLL] Error in poll cycle');
@@ -140,10 +149,65 @@ async function pollAndCheck() {
 }
 
 /**
+ * Start health check HTTP server
+ */
+function startHealthServer() {
+    const port = parseInt(process.env.HEALTH_PORT || '8080', 10);
+
+    const server = http.createServer((req, res) => {
+        if (req.url === '/health' || req.url === '/healthz') {
+            const healthy = lastPollSuccess || lastPollTime === null; // healthy if never polled yet (still starting)
+            const status = healthy ? 200 : 503;
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                status: healthy ? 'ok' : 'unhealthy',
+                version: CURRENT_VERSION,
+                uptime: process.uptime(),
+                last_poll: lastPollTime?.toISOString() || null,
+                last_poll_success: lastPollSuccess,
+                total_checks: totalChecks,
+            }));
+        } else {
+            res.writeHead(404);
+            res.end();
+        }
+    });
+
+    server.listen(port, () => {
+        logger.info(`[HEALTH] Health endpoint listening on :${port}/health`);
+    });
+
+    return server;
+}
+
+/**
+ * Verify API connectivity before starting main loop
+ */
+async function verifyConnectivity() {
+    logger.info('[STARTUP] Verifying API connectivity...');
+    try {
+        await api.getChecks();
+        logger.info('[STARTUP] API connection verified successfully');
+    } catch (error) {
+        if (error.response?.status === 401) {
+            logger.fatal('[STARTUP] Invalid probe token — check your PROBE_TOKEN configuration');
+            process.exit(1);
+        }
+        logger.warn({ err: error }, '[STARTUP] API connection failed — will retry during polling');
+    }
+}
+
+/**
  * Start the worker
  */
 async function start() {
-    logger.info('[m0nitor Worker] Worker started successfully');
+    // Start health server
+    startHealthServer();
+
+    // Verify connectivity
+    await verifyConnectivity();
+
+    logger.info('[m0nitor Agent] Agent started successfully');
 
     // Initial poll
     await pollAndCheck();
@@ -153,7 +217,7 @@ async function start() {
 
     // Handle graceful shutdown
     const shutdown = () => {
-        logger.info('[m0nitor Worker] Shutting down...');
+        logger.info('[m0nitor Agent] Shutting down...');
         process.exit(0);
     };
 
@@ -163,6 +227,6 @@ async function start() {
 
 // Start the worker
 start().catch((error) => {
-    logger.fatal({ err: error }, '[FATAL] Failed to start worker');
+    logger.fatal({ err: error }, '[FATAL] Failed to start agent');
     process.exit(1);
 });
