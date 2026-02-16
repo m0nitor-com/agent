@@ -42,19 +42,13 @@ export async function checkUdp(monitor) {
 
         const timer = setTimeout(() => {
             if (isHandled) return;
-            // For UDP, timeout often means "UP" if no ICMP error was received,
-            // but for a strict check we treat it as "no response".
-            // However, most monitors treat "no response" as successful if it's just a port probe
-            // unless a specific payload/response is defined.
-            // Let's be conservative and treat timeout as success if no error occurred,
-            // or let's just mark it as success for now since UDP is non-guaranteed.
-
-            // Actually, if we send a packet and get nothing, we don't know if it's up or down.
-            // But if we get ECONNREFUSED, it's definitely down.
-            // Many simple monitors mark UDP as "UP" if they don't get an ICMP unreachable.
-
+            // For UDP, no ICMP unreachable within the timeout = port is likely open.
+            // This is the standard behavior for UDP port probing: absence of error
+            // indicates the port accepted or silently dropped the packet.
+            // We mark it as success but flag it as a timeout-based result.
             result.is_success = true;
             result.response_time_ms = Date.now() - startTime;
+            result.error_message = 'No ICMP unreachable received (UDP timeout – assumed open)';
             cleanup();
             resolve(result);
         }, timeout);

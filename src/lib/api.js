@@ -45,6 +45,7 @@ class ApiClient {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
                 'X-Worker-Version': this.version,
+                'Authorization': `Bearer ${this.token}`,
             },
             httpsAgent,
         });
@@ -86,7 +87,7 @@ class ApiClient {
      */
     async getChecks() {
         return this.withRetry(async () => {
-            const response = await this.client.get(`/workers/${this.token}/checks`);
+            const response = await this.client.get('/workers/checks');
             return response.data;
         }, 'getChecks');
     }
@@ -96,7 +97,7 @@ class ApiClient {
      */
     async reportCheck(result) {
         return this.withRetry(async () => {
-            const response = await this.client.post(`/workers/${this.token}/report`, result);
+            const response = await this.client.post('/workers/report', result);
             return response.data;
         }, 'reportCheck');
     }

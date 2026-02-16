@@ -28,6 +28,7 @@ const api = new ApiClient(config.API_URL, config.PROBE_TOKEN);
 let lastPollSuccess = false;
 let lastPollTime = null;
 let totalChecks = 0;
+let latestAvailableVersion = null;
 
 /**
  * Execute a check based on monitor type
@@ -95,6 +96,14 @@ async function pollAndCheck() {
         }
 
         logger.info(`[POLL] Got ${data.monitors.length} monitor(s) to check from ${data.location.code}`);
+
+        // Check for version updates
+        if (data.worker?.latest_version && data.worker.latest_version !== CURRENT_VERSION) {
+            if (latestAvailableVersion !== data.worker.latest_version) {
+                latestAvailableVersion = data.worker.latest_version;
+                logger.warn(`[UPDATE] A newer agent version is available: v${data.worker.latest_version} (current: v${CURRENT_VERSION}). Please update your Docker image.`);
+            }
+        }
 
         // Execute checks in parallel (with concurrency limit)
         const concurrency = 30;
@@ -209,11 +218,14 @@ async function start() {
 
     logger.info('[m0nitor Agent] Agent started successfully');
 
-    // Initial poll
-    await pollAndCheck();
+    // Self-scheduling poll loop (prevents drift/overlap)
+    async function schedulePoll() {
+        await pollAndCheck();
+        setTimeout(schedulePoll, config.POLL_INTERVAL);
+    }
 
-    // Set up polling interval
-    setInterval(pollAndCheck, config.POLL_INTERVAL);
+    // Start first poll
+    schedulePoll();
 
     // Handle graceful shutdown
     const shutdown = () => {

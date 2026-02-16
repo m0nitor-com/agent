@@ -1,6 +1,8 @@
 import axios from 'axios';
 import https from 'https';
 import sslChecker from 'ssl-checker';
+import { logger } from '../lib/logger.js';
+import { config as appConfig } from '../lib/config.js';
 
 /**
  * Perform HTTP/HTTPS check on a monitor
@@ -29,7 +31,7 @@ export async function checkHttp(monitor) {
             maxRedirects: monitor.follow_redirects ? 5 : 0,
             validateStatus: () => true, // Accept any status code
             httpsAgent: new https.Agent({
-                rejectUnauthorized: false, // We'll check SSL separately
+                rejectUnauthorized: !appConfig.SKIP_SSL_VERIFY, // Verify SSL unless explicitly skipped
             }),
         };
 
@@ -74,9 +76,15 @@ export async function checkHttp(monitor) {
 
         // Check keywords if specified
         if (criteria.keywords && criteria.keywords.length > 0) {
-            const bodyText = result.response_body_preview || '';
+            // Search against full response body, not just the 1KB preview
+            let fullBody = '';
+            if (typeof response.data === 'string') {
+                fullBody = response.data;
+            } else if (typeof response.data === 'object') {
+                fullBody = JSON.stringify(response.data);
+            }
             for (const keyword of criteria.keywords) {
-                if (!bodyText.includes(keyword)) {
+                if (!fullBody.includes(keyword)) {
                     result.is_success = false;
                     result.error_type = 'keyword';
                     result.error_message = `Keyword "${keyword}" not found in response`;
@@ -114,7 +122,7 @@ export async function checkHttp(monitor) {
                     return result;
                 }
             } catch (sslError) {
-                console.warn('[HTTP] SSL check failed:', sslError.message);
+                logger.warn({ err: sslError }, '[HTTP] SSL check failed');
                 result.ssl_info = { error: sslError.message };
             }
         }
