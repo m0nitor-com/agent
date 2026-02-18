@@ -14,6 +14,7 @@ export async function checkUdp(monitor) {
 
     return new Promise((resolve) => {
         const startTime = Date.now();
+        let resolved = false;
 
         // Extract host and port
         let host = monitor.url;
@@ -31,54 +32,96 @@ export async function checkUdp(monitor) {
 
         const client = dgram.createSocket('udp4');
         const timeout = (monitor.timeout || 10) * 1000;
-        let isHandled = false;
+        const maxResponseTime = monitor.success_criteria?.max_response_time || 30000;
 
-        const cleanup = () => {
-            if (isHandled) return;
-            isHandled = true;
-            client.close();
+        const done = () => {
+            if (resolved) return;
+            resolved = true;
             clearTimeout(timer);
+            try { client.close(); } catch { /* already closed */ }
+            resolve(result);
         };
 
         const timer = setTimeout(() => {
-            if (isHandled) return;
             // For UDP, no ICMP unreachable within the timeout = port is likely open.
             // This is the standard behavior for UDP port probing: absence of error
             // indicates the port accepted or silently dropped the packet.
-            // We mark it as success but flag it as a timeout-based result.
             result.is_success = true;
             result.response_time_ms = Date.now() - startTime;
-            result.error_message = 'No ICMP unreachable received (UDP timeout – assumed open)';
-            cleanup();
-            resolve(result);
+
+            // Check response time limit
+            if (result.response_time_ms > maxResponseTime) {
+                result.is_success = false;
+                result.error_type = 'response_time';
+                result.error_message = `UDP response time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
+            }
+
+            done();
         }, timeout);
 
         client.on('error', (error) => {
-            result.is_success = false;
             result.response_time_ms = Date.now() - startTime;
-            result.error_type = 'connection';
-            result.error_message = error.message || 'UDP check failed';
-            cleanup();
-            resolve(result);
+            result.is_success = false;
+
+            const code = error.code || '';
+
+            if (code === 'ENOTFOUND') {
+                result.error_type = 'dns';
+                result.error_message = `DNS resolution failed for ${host}`;
+            } else if (code === 'EAI_AGAIN') {
+                result.error_type = 'dns_temporary';
+                result.error_message = `Temporary DNS failure for ${host}`;
+            } else if (code === 'EHOSTUNREACH') {
+                result.error_type = 'host_unreachable';
+                result.error_message = `Host ${host} is unreachable`;
+            } else if (code === 'ENETUNREACH') {
+                result.error_type = 'network_unreachable';
+                result.error_message = `Network is unreachable for ${host}`;
+            } else if (code === 'ECONNREFUSED' || code === 'ECONNRESET') {
+                result.error_type = 'connection';
+                result.error_message = `Port ${port} on ${host} is closed (ICMP unreachable)`;
+            } else if (code === 'EACCES' || code === 'EPERM') {
+                result.error_type = 'permission';
+                result.error_message = `Permission denied sending UDP packet to ${host}:${port}`;
+            } else {
+                result.error_type = 'unknown';
+                result.error_message = error.message || 'UDP check failed';
+            }
+
+            done();
         });
 
         client.on('message', (msg, rinfo) => {
             result.is_success = true;
             result.response_time_ms = Date.now() - startTime;
-            cleanup();
-            resolve(result);
+
+            // Check response time limit
+            if (result.response_time_ms > maxResponseTime) {
+                result.is_success = false;
+                result.error_type = 'response_time';
+                result.error_message = `UDP response time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
+            }
+
+            done();
         });
 
         // Send a small dummy packet to trigger ICMP Unreachable if port is closed
         const message = Buffer.from('ping');
         client.send(message, port, host, (error) => {
             if (error) {
-                result.is_success = false;
                 result.response_time_ms = Date.now() - startTime;
-                result.error_type = 'connection';
-                result.error_message = error.message;
-                cleanup();
-                resolve(result);
+                result.is_success = false;
+
+                const code = error.code || '';
+                if (code === 'ENOTFOUND') {
+                    result.error_type = 'dns';
+                    result.error_message = `DNS resolution failed for ${host}`;
+                } else {
+                    result.error_type = 'connection';
+                    result.error_message = error.message || `Failed to send UDP packet to ${host}:${port}`;
+                }
+
+                done();
             }
             // If sent successfully, we wait for a message or timeout
         });

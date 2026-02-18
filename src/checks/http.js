@@ -1,8 +1,52 @@
 import axios from 'axios';
 import https from 'https';
+import http from 'http';
 import sslChecker from 'ssl-checker';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
+
+/**
+ * Essential response headers worth keeping for diagnostics.
+ * Everything else is noise and wastes bandwidth/storage.
+ */
+const ESSENTIAL_HEADERS = [
+    'content-type',
+    'content-length',
+    'server',
+    'x-powered-by',
+    'cache-control',
+    'location',
+    'x-frame-options',
+    'strict-transport-security',
+    'content-encoding',
+    'x-content-type-options',
+    'x-request-id',
+    'retry-after',
+];
+
+/**
+ * Filter response headers to only essential ones.
+ */
+function filterHeaders(headers) {
+    if (!headers) return null;
+    const filtered = {};
+    for (const key of ESSENTIAL_HEADERS) {
+        if (headers[key] !== undefined) {
+            filtered[key] = headers[key];
+        }
+    }
+    return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+/**
+ * Check if a string looks like valid JSON.
+ */
+function isJsonLike(str) {
+    if (typeof str !== 'string') return false;
+    const trimmed = str.trim();
+    return (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+        (trimmed.startsWith('[') && trimmed.endsWith(']'));
+}
 
 /**
  * Perform HTTP/HTTPS check on a monitor
@@ -22,20 +66,51 @@ export async function checkHttp(monitor) {
     };
 
     try {
+        // Build request headers with sensible defaults
+        const headers = { ...(monitor.headers || {}) };
+
+        // Default User-Agent
+        if (!headers['User-Agent'] && !headers['user-agent']) {
+            headers['User-Agent'] = 'm0nitor/1.0';
+        }
+
+        // Default Accept header
+        if (!headers['Accept'] && !headers['accept']) {
+            headers['Accept'] = '*/*';
+        }
+
+        // Auto Content-Type for body requests (if not explicitly set)
+        const method = (monitor.method || 'GET').toUpperCase();
+        if (monitor.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
+            if (!headers['Content-Type'] && !headers['content-type']) {
+                headers['Content-Type'] = isJsonLike(monitor.body)
+                    ? 'application/json'
+                    : 'text/plain';
+            }
+        }
+
+        const isHttps = monitor.url?.startsWith('https://');
+
         // Build request config
         const config = {
-            method: monitor.method || 'GET',
+            method,
             url: monitor.url,
             timeout: (monitor.timeout || 30) * 1000,
-            headers: monitor.headers || {},
+            headers,
             maxRedirects: monitor.follow_redirects ? 5 : 0,
             validateStatus: () => true, // Accept any status code
-            httpsAgent: new https.Agent({
-                rejectUnauthorized: !appConfig.SKIP_SSL_VERIFY, // Verify SSL unless explicitly skipped
-            }),
         };
 
-        if (monitor.body && ['POST', 'PUT', 'PATCH'].includes(monitor.method)) {
+        // Only create httpsAgent for HTTPS URLs
+        if (isHttps) {
+            config.httpsAgent = new https.Agent({
+                rejectUnauthorized: !appConfig.SKIP_SSL_VERIFY,
+            });
+        } else {
+            config.httpAgent = new http.Agent();
+        }
+
+        if (monitor.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
             config.data = monitor.body;
         }
 
@@ -44,7 +119,22 @@ export async function checkHttp(monitor) {
 
         result.response_time_ms = Date.now() - startTime;
         result.status_code = response.status;
-        result.response_headers = response.headers;
+
+        // Filter response headers to essential ones only
+        const filteredHeaders = filterHeaders(response.headers);
+
+        // Track final URL after redirects
+        const finalUrl = response.request?.res?.responseUrl || response.config?.url;
+        if (finalUrl && finalUrl !== monitor.url) {
+            if (!filteredHeaders) {
+                result.response_headers = { _final_url: finalUrl };
+            } else {
+                filteredHeaders._final_url = finalUrl;
+                result.response_headers = filteredHeaders;
+            }
+        } else {
+            result.response_headers = filteredHeaders;
+        }
 
         // Get response body preview (first 1KB)
         if (typeof response.data === 'string') {
@@ -132,18 +222,59 @@ export async function checkHttp(monitor) {
     } catch (error) {
         result.response_time_ms = Date.now() - startTime;
 
-        if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        const code = error.code || '';
+        const message = error.message || '';
+
+        // Timeout errors
+        if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || code === 'ERR_SOCKET_CONNECTION_TIMEOUT') {
             result.error_type = 'timeout';
             result.error_message = `Connection timed out after ${monitor.timeout || 30}s`;
-        } else if (error.code === 'ENOTFOUND') {
+
+            // DNS errors
+        } else if (code === 'ENOTFOUND') {
             result.error_type = 'dns';
             result.error_message = `DNS resolution failed for ${monitor.url}`;
-        } else if (error.code === 'ECONNREFUSED') {
+        } else if (code === 'EAI_AGAIN') {
+            result.error_type = 'dns_temporary';
+            result.error_message = `Temporary DNS failure for ${monitor.url} (try again later)`;
+
+            // Connection errors
+        } else if (code === 'ECONNREFUSED') {
             result.error_type = 'connection';
             result.error_message = 'Connection refused';
+        } else if (code === 'ECONNRESET') {
+            result.error_type = 'connection_reset';
+            result.error_message = 'Connection was reset by the server';
+        } else if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
+            result.error_type = 'connection_reset';
+            result.error_message = 'Connection was closed unexpectedly';
+
+            // TLS/SSL errors
+        } else if (code === 'CERT_HAS_EXPIRED' || message.includes('certificate has expired')) {
+            result.error_type = 'ssl_expired';
+            result.error_message = 'SSL certificate has expired';
+        } else if (code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+            result.error_type = 'ssl_verify';
+            result.error_message = 'Unable to verify SSL certificate chain';
+        } else if (code === 'ERR_TLS_CERT_ALTNAME_INVALID' || message.includes('altname')) {
+            result.error_type = 'ssl_hostname';
+            result.error_message = 'SSL certificate hostname mismatch';
+        } else if (code === 'DEPTH_ZERO_SELF_SIGNED_CERT' || code === 'SELF_SIGNED_CERT_IN_CHAIN') {
+            result.error_type = 'ssl_self_signed';
+            result.error_message = 'SSL certificate is self-signed or from an untrusted CA';
+        } else if (message.includes('SSL') || message.includes('TLS') || message.includes('certificate')) {
+            result.error_type = 'ssl';
+            result.error_message = `SSL/TLS error: ${message}`;
+
+            // Redirect limit
+        } else if (code === 'ERR_FR_TOO_MANY_REDIRECTS' || message.includes('maxRedirects')) {
+            result.error_type = 'too_many_redirects';
+            result.error_message = 'Too many redirects (max 5)';
+
+            // Catch-all
         } else {
             result.error_type = 'unknown';
-            result.error_message = error.message || 'Unknown error';
+            result.error_message = message || 'Unknown error';
         }
     }
 

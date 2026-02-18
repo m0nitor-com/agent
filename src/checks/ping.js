@@ -1,4 +1,5 @@
 import ping from 'ping';
+import { logger } from '../lib/logger.js';
 
 /**
  * Perform ICMP ping check on a monitor
@@ -29,18 +30,52 @@ export async function checkPing(monitor) {
         });
 
         if (pingResult.alive) {
+            // Parse response time with NaN-safe fallback
+            const avg = parseFloat(pingResult.avg);
+            const time = parseFloat(pingResult.time);
+            result.response_time_ms = !isNaN(avg) ? Math.round(avg) : (!isNaN(time) ? Math.round(time) : 0);
             result.is_success = true;
-            result.response_time_ms = Math.round(parseFloat(pingResult.avg) || parseFloat(pingResult.time));
+
+            // Check response time limit
+            const maxResponseTime = monitor.success_criteria?.max_response_time || 30000;
+            if (result.response_time_ms > maxResponseTime) {
+                result.is_success = false;
+                result.error_type = 'response_time';
+                result.error_message = `Ping time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
+            }
         } else {
             result.is_success = false;
-            result.error_type = 'connection';
-            result.error_message = `Host ${host} is not responding to ping`;
+
+            // Determine specific error based on ping output
+            const output = (pingResult.output || '').toLowerCase();
+            if (output.includes('unreachable') || output.includes('host unreachable')) {
+                result.error_type = 'host_unreachable';
+                result.error_message = `Host ${host} is unreachable`;
+            } else if (output.includes('timed out') || output.includes('timeout')) {
+                result.error_type = 'timeout';
+                result.error_message = `Ping to ${host} timed out`;
+            } else if (output.includes('unknown host') || output.includes('could not find host')) {
+                result.error_type = 'dns';
+                result.error_message = `DNS resolution failed for ${host}`;
+            } else if (output.includes('network is unreachable') || output.includes('network unreachable')) {
+                result.error_type = 'network_unreachable';
+                result.error_message = `Network is unreachable for ${host}`;
+            } else {
+                result.error_type = 'connection';
+                result.error_message = `Host ${host} is not responding to ping`;
+            }
         }
 
     } catch (error) {
         result.is_success = false;
-        result.error_type = 'unknown';
-        result.error_message = error.message || 'Ping failed';
+
+        if (error.message?.includes('not found') || error.message?.includes('ENOTFOUND')) {
+            result.error_type = 'dns';
+            result.error_message = `DNS resolution failed for ${monitor.url}`;
+        } else {
+            result.error_type = 'unknown';
+            result.error_message = error.message || 'Ping failed';
+        }
     }
 
     return result;
