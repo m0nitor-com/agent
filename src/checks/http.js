@@ -102,9 +102,12 @@ export async function checkHttp(monitor) {
         };
 
         // Only create httpsAgent for HTTPS URLs
+        // Respect monitor-level ssl_check setting: if unchecked, don't reject invalid certs
+        // Global SKIP_SSL_VERIFY env var overrides for dev environments
         if (isHttps) {
+            const sslCheck = monitor.success_criteria?.ssl_check !== false; // default true
             config.httpsAgent = new https.Agent({
-                rejectUnauthorized: !appConfig.SKIP_SSL_VERIFY,
+                rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
             });
         } else {
             config.httpAgent = new http.Agent();
