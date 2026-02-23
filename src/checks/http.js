@@ -1,7 +1,7 @@
 import axios from 'axios';
 import https from 'https';
 import http from 'http';
-import sslChecker from 'ssl-checker';
+import tls from 'tls';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
 
@@ -186,33 +186,63 @@ export async function checkHttp(monitor) {
             }
         }
 
-        // SSL check for HTTPS monitors
+        // SSL check for HTTPS monitors — extract cert from existing connection (no extra request!)
         if (monitor.type === 'https' && criteria.ssl_check !== false) {
             try {
-                const urlObj = new URL(monitor.url);
-                const sslResult = await sslChecker(urlObj.hostname);
+                let cert = null;
 
-                result.ssl_info = {
-                    valid: sslResult.valid,
-                    days_remaining: sslResult.daysRemaining,
-                    issuer: sslResult.issuer,
-                    valid_from: sslResult.validFrom,
-                    valid_to: sslResult.validTo,
-                };
-
-                const minDays = criteria.ssl_min_days || 7;
-                if (!sslResult.valid) {
-                    result.is_success = false;
-                    result.error_type = 'ssl';
-                    result.error_message = 'SSL certificate is invalid';
-                    return result;
+                // Try to get cert from the existing axios response socket
+                const socket = response.request?.socket || response.request?.res?.socket;
+                if (socket && typeof socket.getPeerCertificate === 'function') {
+                    cert = socket.getPeerCertificate(true);
                 }
 
-                if (sslResult.daysRemaining < minDays) {
-                    result.is_success = false;
-                    result.error_type = 'ssl';
-                    result.error_message = `SSL certificate expires in ${sslResult.daysRemaining} days (min: ${minDays})`;
-                    return result;
+                // Fallback: raw TLS connect (only if socket cert unavailable, e.g. after redirects)
+                if (!cert || !cert.valid_to) {
+                    const urlObj = new URL(monitor.url);
+                    cert = await new Promise((resolve, reject) => {
+                        const tlsSocket = tls.connect(
+                            { host: urlObj.hostname, port: parseInt(urlObj.port) || 443, servername: urlObj.hostname, timeout: 10000 },
+                            () => {
+                                const peerCert = tlsSocket.getPeerCertificate();
+                                tlsSocket.destroy();
+                                resolve(peerCert);
+                            }
+                        );
+                        tlsSocket.on('error', (err) => { tlsSocket.destroy(); reject(err); });
+                        tlsSocket.setTimeout(10000, () => { tlsSocket.destroy(); reject(new Error('TLS handshake timeout')); });
+                    });
+                }
+
+                if (cert && cert.valid_to) {
+                    const validTo = new Date(cert.valid_to);
+                    const validFrom = new Date(cert.valid_from);
+                    const now = new Date();
+                    const daysRemaining = Math.floor((validTo - now) / (1000 * 60 * 60 * 24));
+                    const isValid = now >= validFrom && now <= validTo;
+
+                    result.ssl_info = {
+                        valid: isValid,
+                        days_remaining: daysRemaining,
+                        issuer: cert.issuer?.O || cert.issuer?.CN || 'Unknown',
+                        valid_from: cert.valid_from,
+                        valid_to: cert.valid_to,
+                    };
+
+                    const minDays = criteria.ssl_min_days || 7;
+                    if (!isValid) {
+                        result.is_success = false;
+                        result.error_type = 'ssl';
+                        result.error_message = 'SSL certificate is invalid';
+                        return result;
+                    }
+
+                    if (daysRemaining < minDays) {
+                        result.is_success = false;
+                        result.error_type = 'ssl';
+                        result.error_message = `SSL certificate expires in ${daysRemaining} days (min: ${minDays})`;
+                        return result;
+                    }
                 }
             } catch (sslError) {
                 logger.warn({ err: sslError }, '[HTTP] SSL check failed');
