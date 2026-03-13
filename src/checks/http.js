@@ -24,6 +24,9 @@ const ESSENTIAL_HEADERS = [
     'retry-after',
 ];
 
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
+const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
 /**
  * Filter response headers to only essential ones.
  */
@@ -48,6 +51,59 @@ function isJsonLike(str) {
         (trimmed.startsWith('[') && trimmed.endsWith(']'));
 }
 
+function hasHeaderCaseInsensitive(headers, needle) {
+    const target = needle.toLowerCase();
+    return Object.keys(headers).some((key) => key.toLowerCase() === target);
+}
+
+function toHeaderValue(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return '';
+    }
+}
+
+function setHeader(normalized, key, value) {
+    const headerName = String(key || '').trim();
+    if (!headerName || !HEADER_NAME_PATTERN.test(headerName)) return;
+    normalized[headerName] = toHeaderValue(value);
+}
+
+/**
+ * Normalize headers so both object and [{key,value}] inputs are supported.
+ * Invalid header names are skipped to avoid request-level failures.
+ */
+function normalizeRequestHeaders(rawHeaders) {
+    const normalized = {};
+
+    if (!rawHeaders || typeof rawHeaders !== 'object') {
+        return normalized;
+    }
+
+    if (Array.isArray(rawHeaders)) {
+        for (const row of rawHeaders) {
+            if (!row || typeof row !== 'object') continue;
+            setHeader(normalized, row.key, row.value);
+        }
+        return normalized;
+    }
+
+    for (const [key, value] of Object.entries(rawHeaders)) {
+        if (/^\d+$/.test(key) && value && typeof value === 'object' && 'key' in value) {
+            setHeader(normalized, value.key, value.value);
+            continue;
+        }
+        setHeader(normalized, key, value);
+    }
+
+    return normalized;
+}
+
 /**
  * Perform HTTP/HTTPS check on a monitor
  */
@@ -67,22 +123,26 @@ export async function checkHttp(monitor) {
 
     try {
         // Build request headers with sensible defaults
-        const headers = { ...(monitor.headers || {}) };
+        const headers = normalizeRequestHeaders(monitor.headers);
 
         // Default User-Agent
-        if (!headers['User-Agent'] && !headers['user-agent']) {
+        if (!hasHeaderCaseInsensitive(headers, 'User-Agent')) {
             headers['User-Agent'] = 'm0nitor/1.0';
         }
 
         // Default Accept header
-        if (!headers['Accept'] && !headers['accept']) {
+        if (!hasHeaderCaseInsensitive(headers, 'Accept')) {
             headers['Accept'] = '*/*';
         }
 
         // Auto Content-Type for body requests (if not explicitly set)
-        const method = (monitor.method || 'GET').toUpperCase();
+        const rawMethod = String(monitor.method || 'GET').toUpperCase();
+        const method = HTTP_METHODS.includes(rawMethod) ? rawMethod : 'GET';
+        if (method !== rawMethod) {
+            logger.warn({ monitor_id: monitor.id, raw_method: rawMethod }, '[HTTP] Invalid method from API, falling back to GET');
+        }
         if (monitor.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
-            if (!headers['Content-Type'] && !headers['content-type']) {
+            if (!hasHeaderCaseInsensitive(headers, 'Content-Type')) {
                 headers['Content-Type'] = isJsonLike(monitor.body)
                     ? 'application/json'
                     : 'text/plain';
@@ -90,14 +150,24 @@ export async function checkHttp(monitor) {
         }
 
         const isHttps = monitor.url?.startsWith('https://');
+        const timeoutSeconds = Number.isFinite(Number(monitor.timeout)) ? Math.max(1, Number(monitor.timeout)) : 30;
+        const followRedirects = monitor.follow_redirects !== false;
+
+        logger.debug({
+            monitor_id: monitor.id,
+            method,
+            header_keys: Object.keys(headers),
+            has_user_agent: hasHeaderCaseInsensitive(headers, 'User-Agent'),
+            follow_redirects: followRedirects,
+        }, '[HTTP] Prepared request');
 
         // Build request config
         const config = {
             method,
             url: monitor.url,
-            timeout: (monitor.timeout || 30) * 1000,
+            timeout: timeoutSeconds * 1000,
             headers,
-            maxRedirects: monitor.follow_redirects ? 5 : 0,
+            maxRedirects: followRedirects ? 5 : 0,
             validateStatus: () => true, // Accept any status code
         };
 
@@ -148,14 +218,19 @@ export async function checkHttp(monitor) {
 
         // Check success criteria
         const criteria = monitor.success_criteria || {};
-        const acceptedCodes = criteria.status_codes || [200, 201, 202, 203, 204];
-        const maxResponseTime = criteria.max_response_time || 30000;
+        const acceptedCodes = Array.isArray(criteria.status_codes)
+            ? criteria.status_codes.map((code) => Number(code)).filter((code) => Number.isFinite(code))
+            : [];
+        const resolvedAcceptedCodes = acceptedCodes.length > 0 ? acceptedCodes : [200, 201, 202, 203, 204];
+        const maxResponseTime = Number.isFinite(Number(criteria.max_response_time))
+            ? Number(criteria.max_response_time)
+            : 30000;
 
         // Check status code
-        if (!acceptedCodes.includes(response.status)) {
+        if (!resolvedAcceptedCodes.includes(response.status)) {
             result.is_success = false;
             result.error_type = 'status_code';
-            result.error_message = `Expected status ${acceptedCodes.join('/')}, got ${response.status}`;
+            result.error_message = `Expected status ${resolvedAcceptedCodes.join('/')}, got ${response.status}`;
             return result;
         }
 
