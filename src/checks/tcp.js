@@ -1,4 +1,10 @@
 import net from 'net';
+import {
+    DEFAULT_MONITOR_TIMEOUT_S,
+    MAX_MONITOR_TIMEOUT_S,
+    MIN_MONITOR_TIMEOUT_S,
+    DEFAULT_MAX_RESPONSE_TIME_MS,
+} from '../lib/constants.js';
 
 /**
  * Perform TCP port check on a monitor
@@ -16,14 +22,6 @@ export async function checkTcp(monitor) {
         const startTime = Date.now();
         let resolved = false;
 
-        const done = () => {
-            if (resolved) return;
-            resolved = true;
-            socket.removeAllListeners();
-            socket.destroy();
-            resolve(result);
-        };
-
         // Extract host and port
         let host = monitor.url;
         let port = monitor.port || 80;
@@ -37,15 +35,14 @@ export async function checkTcp(monitor) {
         }
 
         const socket = new net.Socket();
-        const timeout = (monitor.timeout || 10) * 1000;
+        const timeoutS = Math.min(Math.max(MIN_MONITOR_TIMEOUT_S, monitor.timeout || DEFAULT_MONITOR_TIMEOUT_S), MAX_MONITOR_TIMEOUT_S);
+        const timeout = timeoutS * 1000;
 
-        socket.setTimeout(timeout);
-
-        socket.connect(port, host, () => {
+        // Named handlers for clean removal
+        const onConnect = () => {
             result.response_time_ms = Date.now() - startTime;
 
-            // Check response time limit
-            const maxResponseTime = monitor.success_criteria?.max_response_time || 30000;
+            const maxResponseTime = monitor.success_criteria?.max_response_time || DEFAULT_MAX_RESPONSE_TIME_MS;
             if (result.response_time_ms > maxResponseTime) {
                 result.is_success = false;
                 result.error_type = 'response_time';
@@ -55,17 +52,17 @@ export async function checkTcp(monitor) {
             }
 
             done();
-        });
+        };
 
-        socket.on('timeout', () => {
+        const onTimeout = () => {
             result.response_time_ms = Date.now() - startTime;
             result.is_success = false;
             result.error_type = 'timeout';
-            result.error_message = `Connection to ${host}:${port} timed out after ${monitor.timeout || 10}s`;
+            result.error_message = `Connection to ${host}:${port} timed out after ${timeoutS}s`;
             done();
-        });
+        };
 
-        socket.on('error', (error) => {
+        const onError = (error) => {
             result.response_time_ms = Date.now() - startTime;
             result.is_success = false;
 
@@ -101,7 +98,24 @@ export async function checkTcp(monitor) {
             }
 
             done();
-        });
+        };
+
+        const done = () => {
+            if (resolved) return;
+            resolved = true;
+            // Remove specific listeners instead of removeAllListeners()
+            socket.off('connect', onConnect);
+            socket.off('timeout', onTimeout);
+            socket.off('error', onError);
+            socket.destroy();
+            resolve(result);
+        };
+
+        socket.setTimeout(timeout);
+        socket.on('connect', onConnect);
+        socket.on('timeout', onTimeout);
+        socket.on('error', onError);
+        socket.connect(port, host);
     });
 }
 

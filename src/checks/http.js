@@ -4,12 +4,26 @@ import http from 'http';
 import tls from 'tls';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
+import {
+    MAX_RESPONSE_BODY_LENGTH,
+    MAX_REQUEST_BODY_LENGTH,
+    MAX_HEADER_VALUE_LENGTH,
+    RESPONSE_BODY_PREVIEW_LENGTH,
+    MAX_REDIRECTS,
+    DEFAULT_HTTP_METHOD,
+    DEFAULT_ACCEPTED_STATUS_CODES,
+    DEFAULT_SSL_MIN_DAYS,
+    DEFAULT_MAX_RESPONSE_TIME_MS,
+    TLS_HANDSHAKE_TIMEOUT_MS,
+    MIN_MONITOR_TIMEOUT_S,
+    MAX_MONITOR_TIMEOUT_S,
+    DEFAULT_MONITOR_TIMEOUT_S,
+} from '../lib/constants.js';
 
 /**
  * Essential response headers worth keeping for diagnostics.
- * Everything else is noise and wastes bandwidth/storage.
  */
-const ESSENTIAL_HEADERS = [
+const ESSENTIAL_HEADERS = new Set([
     'content-type',
     'content-length',
     'server',
@@ -22,23 +36,44 @@ const ESSENTIAL_HEADERS = [
     'x-content-type-options',
     'x-request-id',
     'retry-after',
-];
+]);
 
 const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
 /**
- * Filter response headers to only essential ones.
+ * Patterns for sensitive data that should be redacted in response body previews.
+ */
+const SENSITIVE_PATTERNS = [
+    /(?:api[_-]?key|apikey|secret[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|credential)["\s]*[:=]["\s]*["']?[a-zA-Z0-9_\-./+=]{8,}["']?/gi,
+    /(?:Bearer|Basic)\s+[a-zA-Z0-9_\-./+=]{20,}/gi,
+    /eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}/g, // JWT tokens
+];
+
+/**
+ * Filter response headers to only essential ones (O(1) lookup with Set).
  */
 function filterHeaders(headers) {
     if (!headers) return null;
     const filtered = {};
-    for (const key of ESSENTIAL_HEADERS) {
-        if (headers[key] !== undefined) {
-            filtered[key] = headers[key];
+    for (const [key, value] of Object.entries(headers)) {
+        if (ESSENTIAL_HEADERS.has(key.toLowerCase())) {
+            filtered[key] = value;
         }
     }
     return Object.keys(filtered).length > 0 ? filtered : null;
+}
+
+/**
+ * Sanitize response body preview by redacting potential sensitive data.
+ */
+function sanitizeBodyPreview(body) {
+    if (!body || typeof body !== 'string') return body;
+    let sanitized = body;
+    for (const pattern of SENSITIVE_PATTERNS) {
+        sanitized = sanitized.replace(pattern, '[REDACTED]');
+    }
+    return sanitized;
 }
 
 /**
@@ -71,12 +106,13 @@ function toHeaderValue(value) {
 function setHeader(normalized, key, value) {
     const headerName = String(key || '').trim();
     if (!headerName || !HEADER_NAME_PATTERN.test(headerName)) return;
-    normalized[headerName] = toHeaderValue(value);
+    const headerValue = toHeaderValue(value);
+    if (headerValue.length > MAX_HEADER_VALUE_LENGTH) return;
+    normalized[headerName] = headerValue;
 }
 
 /**
  * Normalize headers so both object and [{key,value}] inputs are supported.
- * Invalid header names are skipped to avoid request-level failures.
  */
 function normalizeRequestHeaders(rawHeaders) {
     const normalized = {};
@@ -105,6 +141,25 @@ function normalizeRequestHeaders(rawHeaders) {
 }
 
 /**
+ * Fetch SSL certificate for a given hostname, used as fallback when the
+ * original connection cert is unavailable (e.g. after cross-host redirects).
+ */
+function fetchCertificate(hostname, port = 443) {
+    return new Promise((resolve, reject) => {
+        const tlsSocket = tls.connect(
+            { host: hostname, port, servername: hostname, timeout: TLS_HANDSHAKE_TIMEOUT_MS },
+            () => {
+                const peerCert = tlsSocket.getPeerCertificate();
+                tlsSocket.destroy();
+                resolve(peerCert);
+            }
+        );
+        tlsSocket.on('error', (err) => { tlsSocket.destroy(); reject(err); });
+        tlsSocket.setTimeout(TLS_HANDSHAKE_TIMEOUT_MS, () => { tlsSocket.destroy(); reject(new Error('TLS handshake timeout')); });
+    });
+}
+
+/**
  * Perform HTTP/HTTPS check on a monitor
  */
 export async function checkHttp(monitor) {
@@ -125,19 +180,15 @@ export async function checkHttp(monitor) {
         // Build request headers with sensible defaults
         const headers = normalizeRequestHeaders(monitor.headers);
 
-        // Default User-Agent
         if (!hasHeaderCaseInsensitive(headers, 'User-Agent')) {
             headers['User-Agent'] = 'm0nitor/1.0';
         }
-
-        // Default Accept header
         if (!hasHeaderCaseInsensitive(headers, 'Accept')) {
             headers['Accept'] = '*/*';
         }
 
-        // Auto Content-Type for body requests (if not explicitly set)
-        const rawMethod = String(monitor.method || 'GET').toUpperCase();
-        const method = HTTP_METHODS.includes(rawMethod) ? rawMethod : 'GET';
+        const rawMethod = String(monitor.method || DEFAULT_HTTP_METHOD).toUpperCase();
+        const method = HTTP_METHODS.includes(rawMethod) ? rawMethod : DEFAULT_HTTP_METHOD;
         if (method !== rawMethod) {
             logger.warn({ monitor_id: monitor.id, raw_method: rawMethod }, '[HTTP] Invalid method from API, falling back to GET');
         }
@@ -150,50 +201,51 @@ export async function checkHttp(monitor) {
         }
 
         const isHttps = monitor.url?.startsWith('https://');
-        const timeoutSeconds = Number.isFinite(Number(monitor.timeout)) ? Math.max(1, Number(monitor.timeout)) : 30;
+        const timeoutSeconds = Math.min(
+            Math.max(MIN_MONITOR_TIMEOUT_S, Number.isFinite(Number(monitor.timeout)) ? Number(monitor.timeout) : DEFAULT_MONITOR_TIMEOUT_S),
+            MAX_MONITOR_TIMEOUT_S
+        );
         const followRedirects = monitor.follow_redirects !== false;
 
         logger.debug({
             monitor_id: monitor.id,
             method,
             header_keys: Object.keys(headers),
-            has_user_agent: hasHeaderCaseInsensitive(headers, 'User-Agent'),
             follow_redirects: followRedirects,
         }, '[HTTP] Prepared request');
 
         // Build request config
-        const config = {
+        const requestConfig = {
             method,
             url: monitor.url,
             timeout: timeoutSeconds * 1000,
             headers,
-            maxRedirects: followRedirects ? 5 : 0,
-            validateStatus: () => true, // Accept any status code
+            maxRedirects: followRedirects ? MAX_REDIRECTS : 0,
+            maxContentLength: MAX_RESPONSE_BODY_LENGTH,
+            maxBodyLength: MAX_REQUEST_BODY_LENGTH,
+            validateStatus: () => true,
         };
 
-        // Only create httpsAgent for HTTPS URLs
-        // Respect monitor-level ssl_check setting: if unchecked, don't reject invalid certs
-        // Global SKIP_SSL_VERIFY env var overrides for dev environments
         if (isHttps) {
-            const sslCheck = monitor.success_criteria?.ssl_check !== false; // default true
-            config.httpsAgent = new https.Agent({
+            const sslCheck = monitor.success_criteria?.ssl_check !== false;
+            requestConfig.httpsAgent = new https.Agent({
                 rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
             });
         } else {
-            config.httpAgent = new http.Agent();
+            requestConfig.httpAgent = new http.Agent();
         }
 
         if (monitor.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
-            config.data = monitor.body;
+            requestConfig.data = monitor.body;
         }
 
         // Make the request
-        const response = await axios(config);
+        const response = await axios(requestConfig);
 
         result.response_time_ms = Date.now() - startTime;
         result.status_code = response.status;
 
-        // Filter response headers to essential ones only
+        // Filter response headers
         const filteredHeaders = filterHeaders(response.headers);
 
         // Track final URL after redirects
@@ -209,24 +261,25 @@ export async function checkHttp(monitor) {
             result.response_headers = filteredHeaders;
         }
 
-        // Get response body preview (first 1KB)
+        // Get response body preview (sanitized)
+        let rawPreview = '';
         if (typeof response.data === 'string') {
-            result.response_body_preview = response.data.substring(0, 1024);
+            rawPreview = response.data.substring(0, RESPONSE_BODY_PREVIEW_LENGTH);
         } else if (typeof response.data === 'object') {
-            result.response_body_preview = JSON.stringify(response.data).substring(0, 1024);
+            rawPreview = JSON.stringify(response.data).substring(0, RESPONSE_BODY_PREVIEW_LENGTH);
         }
+        result.response_body_preview = sanitizeBodyPreview(rawPreview);
 
         // Check success criteria
         const criteria = monitor.success_criteria || {};
         const acceptedCodes = Array.isArray(criteria.status_codes)
             ? criteria.status_codes.map((code) => Number(code)).filter((code) => Number.isFinite(code))
             : [];
-        const resolvedAcceptedCodes = acceptedCodes.length > 0 ? acceptedCodes : [200, 201, 202, 203, 204];
+        const resolvedAcceptedCodes = acceptedCodes.length > 0 ? acceptedCodes : DEFAULT_ACCEPTED_STATUS_CODES;
         const maxResponseTime = Number.isFinite(Number(criteria.max_response_time))
             ? Number(criteria.max_response_time)
-            : 30000;
+            : DEFAULT_MAX_RESPONSE_TIME_MS;
 
-        // Check status code
         if (!resolvedAcceptedCodes.includes(response.status)) {
             result.is_success = false;
             result.error_type = 'status_code';
@@ -234,7 +287,6 @@ export async function checkHttp(monitor) {
             return result;
         }
 
-        // Check response time
         if (result.response_time_ms > maxResponseTime) {
             result.is_success = false;
             result.error_type = 'response_time';
@@ -242,9 +294,8 @@ export async function checkHttp(monitor) {
             return result;
         }
 
-        // Check keywords if specified
+        // Check keywords
         if (criteria.keywords && criteria.keywords.length > 0) {
-            // Search against full response body, not just the 1KB preview
             let fullBody = '';
             if (typeof response.data === 'string') {
                 fullBody = response.data;
@@ -261,7 +312,48 @@ export async function checkHttp(monitor) {
             }
         }
 
-        // SSL check for HTTPS monitors — extract cert from existing connection (no extra request!)
+        // Check header assertions
+        if (Array.isArray(criteria.header_assertions) && criteria.header_assertions.length > 0) {
+            for (const assertion of criteria.header_assertions) {
+                const headerName = assertion.header.toLowerCase();
+                const actualValue = response.headers[headerName] || '';
+                const expectedValue = assertion.value || '';
+                const comparison = assertion.comparison;
+                let passed = true;
+
+                switch (comparison) {
+                    case 'contains':
+                        passed = actualValue.toLowerCase().includes(expectedValue.toLowerCase());
+                        break;
+                    case 'not_contains':
+                        passed = !actualValue.toLowerCase().includes(expectedValue.toLowerCase());
+                        break;
+                    case 'eq':
+                        passed = actualValue.toLowerCase() === expectedValue.toLowerCase();
+                        break;
+                    case 'not_eq':
+                        passed = actualValue.toLowerCase() !== expectedValue.toLowerCase();
+                        break;
+                    case 'empty':
+                        passed = !response.headers[headerName] || response.headers[headerName] === '';
+                        break;
+                    case 'not_empty':
+                        passed = !!response.headers[headerName] && response.headers[headerName] !== '';
+                        break;
+                    default:
+                        passed = false;
+                }
+
+                if (!passed) {
+                    result.is_success = false;
+                    result.error_type = 'header';
+                    result.error_message = `Header assertion failed: "${assertion.header}" ${comparison} "${expectedValue}" (actual: "${actualValue}")`;
+                    return result;
+                }
+            }
+        }
+
+        // SSL check for HTTPS monitors
         if (monitor.type === 'https' && criteria.ssl_check !== false) {
             try {
                 let cert = null;
@@ -272,21 +364,25 @@ export async function checkHttp(monitor) {
                     cert = socket.getPeerCertificate(true);
                 }
 
-                // Fallback: raw TLS connect (only if socket cert unavailable, e.g. after redirects)
+                // Determine if we redirected to a different host
+                let certHostname = new URL(monitor.url).hostname;
+                if (finalUrl && finalUrl !== monitor.url) {
+                    try {
+                        const finalHostname = new URL(finalUrl).hostname;
+                        if (finalHostname !== certHostname) {
+                            // Redirected to different host — must fetch cert for the final host
+                            logger.debug({ monitor_id: monitor.id, from: certHostname, to: finalHostname },
+                                '[HTTP] Redirect changed host, fetching SSL cert for final host');
+                            certHostname = finalHostname;
+                            cert = null; // Force re-fetch for correct host
+                        }
+                    } catch { /* ignore URL parse errors */ }
+                }
+
+                // Fallback: raw TLS connect (only if socket cert unavailable)
                 if (!cert || !cert.valid_to) {
-                    const urlObj = new URL(monitor.url);
-                    cert = await new Promise((resolve, reject) => {
-                        const tlsSocket = tls.connect(
-                            { host: urlObj.hostname, port: parseInt(urlObj.port) || 443, servername: urlObj.hostname, timeout: 10000 },
-                            () => {
-                                const peerCert = tlsSocket.getPeerCertificate();
-                                tlsSocket.destroy();
-                                resolve(peerCert);
-                            }
-                        );
-                        tlsSocket.on('error', (err) => { tlsSocket.destroy(); reject(err); });
-                        tlsSocket.setTimeout(10000, () => { tlsSocket.destroy(); reject(new Error('TLS handshake timeout')); });
-                    });
+                    const urlObj = new URL(finalUrl || monitor.url);
+                    cert = await fetchCertificate(urlObj.hostname, parseInt(urlObj.port) || 443);
                 }
 
                 if (cert && cert.valid_to) {
@@ -304,7 +400,7 @@ export async function checkHttp(monitor) {
                         valid_to: cert.valid_to,
                     };
 
-                    const minDays = criteria.ssl_min_days || 7;
+                    const minDays = criteria.ssl_min_days || DEFAULT_SSL_MIN_DAYS;
                     if (!isValid) {
                         result.is_success = false;
                         result.error_type = 'ssl';
@@ -333,20 +429,15 @@ export async function checkHttp(monitor) {
         const code = error.code || '';
         const message = error.message || '';
 
-        // Timeout errors
         if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || code === 'ERR_SOCKET_CONNECTION_TIMEOUT') {
             result.error_type = 'timeout';
-            result.error_message = `Connection timed out after ${monitor.timeout || 30}s`;
-
-            // DNS errors
+            result.error_message = `Connection timed out after ${monitor.timeout || DEFAULT_MONITOR_TIMEOUT_S}s`;
         } else if (code === 'ENOTFOUND') {
             result.error_type = 'dns';
             result.error_message = `DNS resolution failed for ${monitor.url}`;
         } else if (code === 'EAI_AGAIN') {
             result.error_type = 'dns_temporary';
             result.error_message = `Temporary DNS failure for ${monitor.url} (try again later)`;
-
-            // Connection errors
         } else if (code === 'ECONNREFUSED') {
             result.error_type = 'connection';
             result.error_message = 'Connection refused';
@@ -356,8 +447,6 @@ export async function checkHttp(monitor) {
         } else if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
             result.error_type = 'connection_reset';
             result.error_message = 'Connection was closed unexpectedly';
-
-            // TLS/SSL errors
         } else if (code === 'CERT_HAS_EXPIRED' || message.includes('certificate has expired')) {
             result.error_type = 'ssl_expired';
             result.error_message = 'SSL certificate has expired';
@@ -373,13 +462,9 @@ export async function checkHttp(monitor) {
         } else if (message.includes('SSL') || message.includes('TLS') || message.includes('certificate')) {
             result.error_type = 'ssl';
             result.error_message = `SSL/TLS error: ${message}`;
-
-            // Redirect limit
         } else if (code === 'ERR_FR_TOO_MANY_REDIRECTS' || message.includes('maxRedirects')) {
             result.error_type = 'too_many_redirects';
-            result.error_message = 'Too many redirects (max 5)';
-
-            // Catch-all
+            result.error_message = `Too many redirects (max ${MAX_REDIRECTS})`;
         } else {
             result.error_type = 'unknown';
             result.error_message = message || 'Unknown error';

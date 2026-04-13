@@ -1,6 +1,9 @@
 import { config } from './lib/config.js';
 import { logger } from './lib/logger.js';
 import ApiClient from './lib/api.js';
+import { validateMonitor } from './lib/validator.js';
+import { ResultQueue } from './lib/result-queue.js';
+import { HEALTH_UNHEALTHY_AFTER_FAILED_POLLS } from './lib/constants.js';
 import checkHttp from './checks/http.js';
 import checkPing from './checks/ping.js';
 import checkTcp from './checks/tcp.js';
@@ -20,12 +23,14 @@ const CURRENT_VERSION = pkg.version;
 logger.info(`[m0nitor Agent] Starting up v${CURRENT_VERSION}...`);
 logger.info(`[CONFIG] API URL: ${config.API_URL}`);
 logger.info(`[CONFIG] Poll Interval: ${config.POLL_INTERVAL}ms`);
+logger.info(`[CONFIG] Concurrency Limit: ${config.CONCURRENCY_LIMIT}`);
 
-// Initialize API client
+// Initialize API client and result queue
 const api = new ApiClient(config.API_URL, config.PROBE_TOKEN);
+const resultQueue = new ResultQueue(api);
 
 // Health state
-let lastPollSuccess = false;
+let consecutiveFailedPolls = 0;
 let lastPollTime = null;
 let totalChecks = 0;
 let latestAvailableVersion = null;
@@ -87,7 +92,7 @@ async function pollAndCheck() {
         // Fetch monitors that need checking
         const data = await api.getChecks();
 
-        lastPollSuccess = true;
+        consecutiveFailedPolls = 0;
         lastPollTime = new Date();
 
         if (!data.monitors || data.monitors.length === 0) {
@@ -95,7 +100,7 @@ async function pollAndCheck() {
             return;
         }
 
-        logger.info(`[POLL] Got ${data.monitors.length} monitor(s) to check from ${data.location.code}`);
+        logger.info(`[POLL] Got ${data.monitors.length} monitor(s) to check from ${data.location?.code || 'unknown'}`);
 
         // Check for version updates
         if (data.worker?.latest_version && data.worker.latest_version !== CURRENT_VERSION) {
@@ -105,9 +110,22 @@ async function pollAndCheck() {
             }
         }
 
-        // Execute checks in parallel (with concurrency limit)
-        const concurrency = 30;
-        const monitors = data.monitors;
+        // Validate and filter monitors
+        const monitors = data.monitors
+            .map(m => validateMonitor(m))
+            .filter(m => m !== null);
+
+        if (monitors.length === 0) {
+            logger.warn('[POLL] All monitors failed validation');
+            return;
+        }
+
+        if (monitors.length < data.monitors.length) {
+            logger.warn(`[POLL] ${data.monitors.length - monitors.length} monitor(s) skipped due to validation errors`);
+        }
+
+        // Execute checks in parallel (with configurable concurrency limit)
+        const concurrency = config.CONCURRENCY_LIMIT;
 
         for (let i = 0; i < monitors.length; i += concurrency) {
             const batch = monitors.slice(i, i + concurrency);
@@ -133,26 +151,22 @@ async function pollAndCheck() {
                 })
             );
 
-            // Report results
+            // Report results via queue (auto-retries on failure)
             for (const result of results) {
-                try {
-                    const status = result.is_success ? '✓' : '✗';
-                    logger.info(`[REPORT] ${status} Monitor #${result.monitor_id}: ${result.response_time_ms || 0}ms`);
-                    await api.reportCheck(result);
-                    totalChecks++;
-                } catch (error) {
-                    logger.error({ err: error, monitor_id: result.monitor_id }, `[REPORT] Failed to report result`);
-                }
+                const status = result.is_success ? '✓' : '✗';
+                logger.info(`[REPORT] ${status} Monitor #${result.monitor_id}: ${result.response_time_ms || 0}ms`);
+                await resultQueue.submit(result);
+                totalChecks++;
             }
         }
 
     } catch (error) {
-        lastPollSuccess = false;
+        consecutiveFailedPolls++;
         if (error.response?.status === 401) {
             logger.fatal('[ERROR] Invalid or expired probe token');
             process.exit(1);
         } else {
-            logger.error({ err: error }, '[POLL] Error in poll cycle');
+            logger.error({ err: error }, `[POLL] Error in poll cycle (${consecutiveFailedPolls} consecutive failure(s))`);
         }
     }
 }
@@ -161,11 +175,12 @@ async function pollAndCheck() {
  * Start health check HTTP server
  */
 function startHealthServer() {
-    const port = parseInt(process.env.HEALTH_PORT || '8080', 10);
+    const port = config.HEALTH_PORT;
 
     const server = http.createServer((req, res) => {
         if (req.url === '/health' || req.url === '/healthz') {
-            const healthy = lastPollSuccess || lastPollTime === null; // healthy if never polled yet (still starting)
+            // Healthy if: never polled yet (starting up) OR not too many consecutive failures
+            const healthy = lastPollTime === null || consecutiveFailedPolls < HEALTH_UNHEALTHY_AFTER_FAILED_POLLS;
             const status = healthy ? 200 : 503;
             res.writeHead(status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({
@@ -173,8 +188,9 @@ function startHealthServer() {
                 version: CURRENT_VERSION,
                 uptime: process.uptime(),
                 last_poll: lastPollTime?.toISOString() || null,
-                last_poll_success: lastPollSuccess,
+                consecutive_failed_polls: consecutiveFailedPolls,
                 total_checks: totalChecks,
+                queued_results: resultQueue.size,
             }));
         } else {
             res.writeHead(404);
@@ -230,6 +246,7 @@ async function start() {
     // Handle graceful shutdown
     const shutdown = () => {
         logger.info('[m0nitor Agent] Shutting down...');
+        resultQueue.stop();
         process.exit(0);
     };
 

@@ -25,11 +25,12 @@ USER worker
 # Environment variables (defaults)
 ENV NODE_ENV=production
 ENV LOG_LEVEL=info
+ENV HEALTH_PORT=8080
 
-# Health check endpoint
-EXPOSE 8080
+# Health check endpoint — uses the same HEALTH_PORT env var as the app
+EXPOSE ${HEALTH_PORT}
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://localhost:8080/health || exit 1
+    CMD wget -qO- http://localhost:${HEALTH_PORT}/health || exit 1
 
 # Start the agent
 CMD ["npm", "start"]

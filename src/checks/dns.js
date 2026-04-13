@@ -1,10 +1,42 @@
 import dns from 'dns/promises';
 import net from 'net';
+import {
+    DNS_RESOLUTION_TIMEOUT_MS,
+    MAX_DNS_RECORDS,
+    DEFAULT_MAX_RESPONSE_TIME_MS,
+} from '../lib/constants.js';
+
+/**
+ * Resolve a hostname with a timeout.
+ */
+const resolveWithTimeout = (hostname, timeout = DNS_RESOLUTION_TIMEOUT_MS) => {
+    return Promise.race([
+        dns.resolve4(hostname),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('DNS resolution timeout')), timeout))
+    ]);
+};
+
+/**
+ * Singleton DNS resolver cache.
+ * Reuses resolver instances keyed by their server configuration.
+ */
+const resolverCache = new Map();
+
+function getResolver(servers) {
+    const key = servers ? servers.sort().join(',') : '__system__';
+    let resolver = resolverCache.get(key);
+    if (!resolver) {
+        resolver = new dns.Resolver();
+        if (servers) {
+            resolver.setServers(servers);
+        }
+        resolverCache.set(key, resolver);
+    }
+    return resolver;
+}
 
 /**
  * Execute a DNS check
- * @param {Object} monitor
- * @returns {Promise<Object>}
  */
 async function checkDns(monitor) {
     const start = Date.now();
@@ -12,25 +44,26 @@ async function checkDns(monitor) {
     const recordType = (monitor.method || 'A').toUpperCase();
     const expectedValue = monitor.success_criteria?.expected_value || null;
     const customServer = monitor.success_criteria?.dns_server || null;
-    const maxResponseTime = monitor.success_criteria?.max_response_time || 30000;
+    const maxResponseTime = monitor.success_criteria?.max_response_time || DEFAULT_MAX_RESPONSE_TIME_MS;
 
     try {
         let results = [];
-        const resolver = new dns.Resolver();
+        let resolverServers = null;
 
         if (customServer) {
             if (net.isIP(customServer)) {
-                resolver.setServers([customServer]);
+                resolverServers = [customServer];
             } else {
-                // If it's a hostname, resolve it first using default DNS
-                const ips = await dns.resolve4(customServer);
+                const ips = await resolveWithTimeout(customServer);
                 if (ips.length > 0) {
-                    resolver.setServers(ips);
+                    resolverServers = ips;
                 } else {
                     throw new Error(`Could not resolve custom DNS server hostname: ${customServer}`);
                 }
             }
         }
+
+        const resolver = getResolver(resolverServers);
 
         switch (recordType) {
             case 'A':
@@ -70,15 +103,13 @@ async function checkDns(monitor) {
 
         const responseTime = Date.now() - start;
 
-        // Build dns_info with resolved records
         const dnsInfo = {
             record_type: recordType,
-            records: results.slice(0, 10), // Cap at 10 records to limit payload
+            records: results.slice(0, MAX_DNS_RECORDS),
             server: customServer || 'system',
             record_count: results.length,
         };
 
-        // Check response time limit
         if (responseTime > maxResponseTime) {
             return {
                 monitor_id: monitor.id,
@@ -90,7 +121,6 @@ async function checkDns(monitor) {
             };
         }
 
-        // Check against expected value if provided
         if (expectedValue) {
             const match = results.some(val =>
                 String(val).toLowerCase().includes(expectedValue.toLowerCase())

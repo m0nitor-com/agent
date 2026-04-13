@@ -48,7 +48,10 @@ export async function checkPing(monitor) {
 
             // Determine specific error based on ping output
             const output = (pingResult.output || '').toLowerCase();
-            if (output.includes('unreachable') || output.includes('host unreachable')) {
+            if (output.includes('network is unreachable') || output.includes('network unreachable')) {
+                result.error_type = 'network_unreachable';
+                result.error_message = `Network is unreachable for ${host}`;
+            } else if (output.includes('unreachable') || output.includes('host unreachable')) {
                 result.error_type = 'host_unreachable';
                 result.error_message = `Host ${host} is unreachable`;
             } else if (output.includes('timed out') || output.includes('timeout')) {
@@ -57,9 +60,6 @@ export async function checkPing(monitor) {
             } else if (output.includes('unknown host') || output.includes('could not find host')) {
                 result.error_type = 'dns';
                 result.error_message = `DNS resolution failed for ${host}`;
-            } else if (output.includes('network is unreachable') || output.includes('network unreachable')) {
-                result.error_type = 'network_unreachable';
-                result.error_message = `Network is unreachable for ${host}`;
             } else {
                 result.error_type = 'connection';
                 result.error_message = `Host ${host} is not responding to ping`;
