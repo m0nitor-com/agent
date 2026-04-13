@@ -91,7 +91,7 @@ export async function checkUdp(monitor) {
             done();
         });
 
-        client.on('message', (msg, rinfo) => {
+        client.on('message', (_msg, _rinfo) => {
             result.is_success = true;
             result.response_time_ms = Date.now() - startTime;
 

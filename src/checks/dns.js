@@ -86,13 +86,15 @@ async function checkDns(monitor) {
             case 'CNAME':
                 results = await resolver.resolveCname(hostname);
                 break;
-            case 'SOA':
+            case 'SOA': {
                 const soa = await resolver.resolveSoa(hostname);
                 results = [`${soa.nsname} ${soa.hostmaster} ${soa.serial} ${soa.refresh} ${soa.retry} ${soa.expire} ${soa.minttl}`];
                 break;
-            case 'SRV':
+            }
+            case 'SRV': {
                 const srv = await resolver.resolveSrv(hostname);
                 results = srv.map(s => `${s.name} ${s.port} ${s.priority} ${s.weight}`);
+            }
                 break;
             case 'PTR':
                 results = await resolver.reverse(hostname);

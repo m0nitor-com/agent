@@ -1,5 +1,4 @@
 import ping from 'ping';
-import { logger } from '../lib/logger.js';
 
 /**
  * Perform ICMP ping check on a monitor
