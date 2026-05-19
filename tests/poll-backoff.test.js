@@ -7,9 +7,10 @@ describe('computeNextPollDelay', () => {
         expect(result).toBe(5000);
     });
 
-    it('returns 0 with rng=()=>0 and 9999 with rng=()=>0.999 when failures=1, base=5000, max=300000', () => {
+    it('returns 0 with rng=()=>0 and 9990 with rng=()=>0.999 when failures=1, base=5000, max=300000', () => {
         expect(computeNextPollDelay(5000, 300_000, 1, () => 0)).toBe(0);
-        expect(computeNextPollDelay(5000, 300_000, 1, () => 0.999)).toBe(9999);
+        // target = min(5000 * 2^1, 300_000) = 10_000; floor(0.999 * 10_000) = 9990.
+        expect(computeNextPollDelay(5000, 300_000, 1, () => 0.999)).toBe(9990);
     });
 
     it('target grows ~2x per failure before the cap is reached (n=1..4)', () => {
