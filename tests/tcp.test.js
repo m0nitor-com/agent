@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import EventEmitter from 'events';
 
+vi.mock('../src/lib/logger.js', () => ({
+    logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
+
+// SSRF guard OFF for this suite so existing tests run unimpeded.
+vi.mock('../src/lib/config.js', () => ({
+    config: { ALLOW_PRIVATE_TARGETS: true },
+}));
+
 let mockSocket;
 
 function createMockSocket() {

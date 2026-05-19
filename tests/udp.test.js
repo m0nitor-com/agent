@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import EventEmitter from 'events';
 
+vi.mock('../src/lib/logger.js', () => ({
+    logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
+}));
+
+// SSRF guard OFF for this suite (existing fixtures use private IPs like 192.168.1.1).
+vi.mock('../src/lib/config.js', () => ({
+    config: { ALLOW_PRIVATE_TARGETS: true },
+}));
+
 let mockSocket;
 
 vi.mock('dgram', () => ({

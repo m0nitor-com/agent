@@ -1,4 +1,7 @@
 import net from 'net';
+import { logger } from '../lib/logger.js';
+import { config as appConfig } from '../lib/config.js';
+import { resolveAndCheck } from '../lib/ssrf.js';
 import {
     DEFAULT_MONITOR_TIMEOUT_S,
     MAX_MONITOR_TIMEOUT_S,
@@ -10,6 +13,7 @@ import {
  * Perform TCP port check on a monitor
  */
 export async function checkTcp(monitor) {
+    const startTime = Date.now();
     const result = {
         monitor_id: monitor.id,
         is_success: false,
@@ -18,21 +22,32 @@ export async function checkTcp(monitor) {
         error_type: null,
     };
 
-    return new Promise((resolve) => {
-        const startTime = Date.now();
-        let resolved = false;
+    // Extract host and port up-front so we can run the SSRF pre-flight.
+    let host = monitor.url;
+    let port = monitor.port || 80;
 
-        // Extract host and port
-        let host = monitor.url;
-        let port = monitor.port || 80;
+    try {
+        const url = new URL(monitor.url);
+        host = url.hostname;
+        port = monitor.port || parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
+    } catch {
+        // url is likely just an IP or hostname
+    }
 
-        try {
-            const url = new URL(monitor.url);
-            host = url.hostname;
-            port = monitor.port || parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-        } catch {
-            // url is likely just an IP or hostname
+    const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
+    if (!allowPrivate) {
+        const check = await resolveAndCheck(host);
+        if (!check.ok && check.reason === 'blocked_private_target') {
+            result.response_time_ms = Date.now() - startTime;
+            result.error_type = 'blocked_private_target';
+            result.error_message = `Target ${host} resolves to a private/reserved IP (${check.ip})`;
+            logger.warn({ monitor_id: monitor.id, host, ip: check.ip }, '[TCP] Blocked private target');
+            return result;
         }
+    }
+
+    return new Promise((resolve) => {
+        let resolved = false;
 
         const socket = new net.Socket();
         const timeoutS = Math.min(Math.max(MIN_MONITOR_TIMEOUT_S, monitor.timeout || DEFAULT_MONITOR_TIMEOUT_S), MAX_MONITOR_TIMEOUT_S);

@@ -37,6 +37,21 @@ export function validateMonitor(raw) {
         return null;
     }
 
+    // Scheme validation: only http(s) for http/https monitors. Other types accept
+    // bare hostnames (tcp/udp/ping/dns/ssh), so we skip URL parsing for them.
+    if (type === 'http' || type === 'https') {
+        try {
+            const u = new URL(raw.url);
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+                logger.warn({ monitor_id: raw.id, scheme: u.protocol }, '[VALIDATOR] Rejected non-http(s) scheme');
+                return null;
+            }
+        } catch {
+            logger.warn({ monitor_id: raw.id, url: raw.url }, '[VALIDATOR] Malformed URL for http monitor');
+            return null;
+        }
+    }
+
     // Clamp timeout
     let timeout = Number(raw.timeout);
     if (!Number.isFinite(timeout) || timeout < MIN_MONITOR_TIMEOUT_S) {

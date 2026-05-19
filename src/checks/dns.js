@@ -1,5 +1,7 @@
 import dns from 'dns/promises';
 import net from 'net';
+import { config as appConfig } from '../lib/config.js';
+import { resolveAndCheck } from '../lib/ssrf.js';
 import {
     DNS_RESOLUTION_TIMEOUT_MS,
     MAX_DNS_RECORDS,
@@ -49,6 +51,23 @@ async function checkDns(monitor) {
     try {
         let results = [];
         let resolverServers = null;
+
+        // SSRF mitigation: guard the DNS server we are about to query against —
+        // NOT the queried hostname (legitimate DNS monitors may target public
+        // domains that happen to resolve to internal IPs).
+        const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
+        if (customServer && !allowPrivate) {
+            const check = await resolveAndCheck(customServer);
+            if (!check.ok && check.reason === 'blocked_private_target') {
+                return {
+                    monitor_id: monitor.id,
+                    is_success: false,
+                    response_time_ms: Date.now() - start,
+                    error_type: 'blocked_private_target',
+                    error_message: `DNS server ${customServer} resolves to a private/reserved IP (${check.ip})`,
+                };
+            }
+        }
 
         if (customServer) {
             if (net.isIP(customServer)) {

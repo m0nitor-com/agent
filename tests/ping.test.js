@@ -4,6 +4,10 @@ vi.mock('../src/lib/logger.js', () => ({
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
+vi.mock('../src/lib/config.js', () => ({
+    config: { ALLOW_PRIVATE_TARGETS: true },
+}));
+
 const mockProbe = vi.fn();
 vi.mock('ping', () => ({
     default: {
