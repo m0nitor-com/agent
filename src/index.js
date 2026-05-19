@@ -54,6 +54,12 @@ let lastPollTime = null;
 let totalChecks = 0;
 let latestAvailableVersion = null;
 
+export function computeNextPollDelay(baseInterval, maxInterval, consecutiveFailures, rng = Math.random) {
+    if (consecutiveFailures <= 0) return baseInterval;
+    const target = Math.min(baseInterval * Math.pow(2, consecutiveFailures), maxInterval);
+    return Math.floor(rng() * target);
+}
+
 /**
  * Execute a check based on monitor type
  */
@@ -245,6 +251,11 @@ async function verifyConnectivity() {
  * Start the worker
  */
 async function start() {
+    if (config.POLL_MAX_INTERVAL < config.POLL_INTERVAL) {
+        logger.fatal({ POLL_INTERVAL: config.POLL_INTERVAL, POLL_MAX_INTERVAL: config.POLL_MAX_INTERVAL }, '[FATAL] POLL_MAX_INTERVAL must be >= POLL_INTERVAL');
+        process.exit(1);
+    }
+
     // Start health server
     startHealthServer();
 
@@ -256,7 +267,11 @@ async function start() {
     // Self-scheduling poll loop (prevents drift/overlap)
     async function schedulePoll() {
         await pollAndCheck();
-        setTimeout(schedulePoll, config.POLL_INTERVAL);
+        const delay = computeNextPollDelay(config.POLL_INTERVAL, config.POLL_MAX_INTERVAL, consecutiveFailedPolls);
+        if (consecutiveFailedPolls > 0) {
+            logger.warn({ consecutive_failed_polls: consecutiveFailedPolls, next_poll_ms: delay, max_interval_ms: config.POLL_MAX_INTERVAL }, '[POLL] Backing off next poll due to consecutive failures');
+        }
+        setTimeout(schedulePoll, delay);
     }
 
     // Start first poll
