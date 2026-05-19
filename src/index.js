@@ -4,6 +4,7 @@ import ApiClient from './lib/api.js';
 import { validateMonitor } from './lib/validator.js';
 import { ResultQueue } from './lib/result-queue.js';
 import { HEALTH_UNHEALTHY_AFTER_FAILED_POLLS } from './lib/constants.js';
+import { computeNextPollDelay } from './lib/backoff.js';
 import checkHttp from './checks/http.js';
 import checkPing from './checks/ping.js';
 import checkTcp from './checks/tcp.js';
@@ -53,12 +54,6 @@ let consecutiveFailedPolls = 0;
 let lastPollTime = null;
 let totalChecks = 0;
 let latestAvailableVersion = null;
-
-export function computeNextPollDelay(baseInterval, maxInterval, consecutiveFailures, rng = Math.random) {
-    if (consecutiveFailures <= 0) return baseInterval;
-    const target = Math.min(baseInterval * Math.pow(2, consecutiveFailures), maxInterval);
-    return Math.floor(rng() * target);
-}
 
 /**
  * Execute a check based on monitor type
