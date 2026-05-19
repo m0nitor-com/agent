@@ -83,9 +83,13 @@ All configuration is done via environment variables.
 | `PROBE_TOKEN` | The unique authentication token for this agent | **Required** |
 | `LOG_LEVEL` | Logging verbosity (`debug`, `info`, `warn`, `error`) | `info` |
 | `POLL_INTERVAL`| Time between check cycles in milliseconds | `5000` |
+| `POLL_MAX_INTERVAL` | Cap for exponential backoff under consecutive poll failures (ms). Worker rate-limits its API polls when the console is unreachable, capping the delay here. Set equal to `POLL_INTERVAL` to disable backoff. | `300000` |
 | `SKIP_SSL_VERIFY` | Skip SSL certificate verification (**INSECURE**) | `false` |
+| `ALLOW_PRIVATE_TARGETS` | Global override for the SSRF guard — when `true`, the worker will accept monitor targets that resolve to private/reserved IP ranges (RFC1918, loopback, link-local, etc.). Intended for self-hosted operators monitoring trusted LAN. Per-monitor opt-in via `monitor.allow_private_target` (Business+ plan-gated on the console) takes precedence. **Leave `false` for SaaS / untrusted environments.** | `false` |
 
-> ⚠️ **Security Warning**: Only set `SKIP_SSL_VERIFY=true` in development environments with self-signed certificates. Never use this in production as it allows man-in-the-middle attacks.
+> ⚠️ **Security Warnings**:
+> - Only set `SKIP_SSL_VERIFY=true` in development environments with self-signed certificates. Never use this in production as it allows man-in-the-middle attacks.
+> - `ALLOW_PRIVATE_TARGETS=true` disables SSRF egress protection globally. Use only on isolated worker instances where every operator is trusted to define monitor targets.
 
 ## 📦 Deployment / Updates
 
