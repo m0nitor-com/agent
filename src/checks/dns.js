@@ -1,6 +1,7 @@
 import dns from 'dns/promises';
 import net from 'net';
 import { config as appConfig } from '../lib/config.js';
+import { logger } from '../lib/logger.js';
 import { resolveAndCheck } from '../lib/ssrf.js';
 import {
     DNS_RESOLUTION_TIMEOUT_MS,
@@ -59,6 +60,7 @@ async function checkDns(monitor) {
         if (customServer && !allowPrivate) {
             const check = await resolveAndCheck(customServer);
             if (!check.ok && check.reason === 'blocked_private_target') {
+                logger.warn({ monitor_id: monitor.id, dns_server: customServer, ip: check.ip }, '[DNS] Blocked private target');
                 return {
                     monitor_id: monitor.id,
                     is_success: false,
