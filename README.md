@@ -47,6 +47,8 @@ docker-compose up -d
 
 ### Option 3: Manual Installation (Node.js)
 
+**Prerequisites**: Node.js 20 LTS or newer.
+
 1. **Clone the repository**:
    ```bash
    git clone https://github.com/m0nitor-com/agent.git
