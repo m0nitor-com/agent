@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeNextPollDelay } from '../src/index.js';
+import { computeNextPollDelay } from '../src/lib/backoff.js';
 
 describe('computeNextPollDelay', () => {
     it('returns exactly baseInterval when consecutiveFailures === 0 (no jitter on success path)', () => {
