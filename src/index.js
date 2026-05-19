@@ -29,6 +29,25 @@ logger.info(`[CONFIG] Concurrency Limit: ${config.CONCURRENCY_LIMIT}`);
 const api = new ApiClient(config.API_URL, config.PROBE_TOKEN);
 const resultQueue = new ResultQueue(api);
 
+// Last-resort process-level handlers: log fatally, best-effort flush, then exit.
+let isShuttingDown = false;
+
+process.on('unhandledRejection', (reason, promise) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    logger.fatal({ err: reason, promise }, '[FATAL] Unhandled promise rejection');
+    try { resultQueue.stop(); } catch (e) { /* swallow — best-effort */ }
+    setTimeout(() => process.exit(1), 1000).unref();
+});
+
+process.on('uncaughtException', (err) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    logger.fatal({ err }, '[FATAL] Uncaught exception');
+    // Do NOT touch resultQueue — state may be corrupt
+    setTimeout(() => process.exit(1), 500).unref();
+});
+
 // Health state
 let consecutiveFailedPolls = 0;
 let lastPollTime = null;

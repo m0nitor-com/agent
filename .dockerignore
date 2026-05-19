@@ -1,0 +1,16 @@
+node_modules
+npm-debug.log*
+.git
+.github
+.gitignore
+.idea
+.vscode
+tests
+coverage
+.env
+.env.*
+!.env.example
+*.md
+Dockerfile
+.dockerignore
+.eslintrc.json
