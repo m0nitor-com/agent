@@ -97,4 +97,35 @@ describe('validateMonitor', () => {
         });
         expect(result.success_criteria.ssl_min_days).toBe(7);
     });
+
+    it('rejects file: scheme for http monitors', () => {
+        const result = validateMonitor({
+            ...validMonitor,
+            type: 'http',
+            url: 'file:///etc/passwd',
+        });
+        expect(result).toBeNull();
+    });
+
+    it('accepts bare hostname for tcp monitors (no scheme required)', () => {
+        const result = validateMonitor({
+            id: 2,
+            type: 'tcp',
+            name: 'TCP Monitor',
+            url: 'myserver.internal',
+            timeout: 10,
+            success_criteria: {},
+        });
+        expect(result).not.toBeNull();
+        expect(result.url).toBe('myserver.internal');
+    });
+
+    it('passes through allow_private_target field on http monitors', () => {
+        const result = validateMonitor({
+            ...validMonitor,
+            allow_private_target: true,
+        });
+        expect(result).not.toBeNull();
+        expect(result.allow_private_target).toBe(true);
+    });
 });

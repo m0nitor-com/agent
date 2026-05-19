@@ -1,9 +1,13 @@
 import ping from 'ping';
+import { logger } from '../lib/logger.js';
+import { config as appConfig } from '../lib/config.js';
+import { resolveAndCheck } from '../lib/ssrf.js';
 
 /**
  * Perform ICMP ping check on a monitor
  */
 export async function checkPing(monitor) {
+    const startTime = Date.now();
     const result = {
         monitor_id: monitor.id,
         is_success: false,
@@ -20,6 +24,18 @@ export async function checkPing(monitor) {
             host = url.hostname;
         } catch {
             // url is likely just an IP or hostname
+        }
+
+        const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
+        if (!allowPrivate) {
+            const check = await resolveAndCheck(host);
+            if (!check.ok && check.reason === 'blocked_private_target') {
+                result.response_time_ms = Date.now() - startTime;
+                result.error_type = 'blocked_private_target';
+                result.error_message = `Target ${host} resolves to a private/reserved IP (${check.ip})`;
+                logger.warn({ monitor_id: monitor.id, host, ip: check.ip }, '[PING] Blocked private target');
+                return result;
+            }
         }
 
         const isWindows = process.platform === 'win32';

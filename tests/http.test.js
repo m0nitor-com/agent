@@ -5,7 +5,7 @@ vi.mock('../src/lib/logger.js', () => ({
 }));
 
 vi.mock('../src/lib/config.js', () => ({
-    config: { SKIP_SSL_VERIFY: false },
+    config: { SKIP_SSL_VERIFY: false, ALLOW_PRIVATE_TARGETS: true },
 }));
 
 const mockAxios = vi.fn();

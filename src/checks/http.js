@@ -2,8 +2,11 @@ import axios from 'axios';
 import https from 'https';
 import http from 'http';
 import tls from 'tls';
+import dns from 'node:dns';
+import ipaddr from 'ipaddr.js';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
+import { resolveAndCheck, isPrivateIp } from '../lib/ssrf.js';
 import {
     MAX_RESPONSE_BODY_LENGTH,
     MAX_REQUEST_BODY_LENGTH,
@@ -176,6 +179,29 @@ export async function checkHttp(monitor) {
         ssl_info: null,
     };
 
+    // SSRF mitigation: block requests targeting private/reserved IPs unless the
+    // monitor or the worker is explicitly opted into private targets.
+    const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
+
+    // Guarded DNS lookup used by the http/https agents to prevent connecting to
+    // private addresses (handles cases where DNS rebinding could trick us between
+    // the pre-flight check and the actual socket connection).
+    const guardedLookup = (hostname, options, cb) => {
+        dns.lookup(hostname, { all: true, verbatim: true }, (err, addrs) => {
+            if (err) return cb(err);
+            const list = Array.isArray(addrs) ? addrs : [addrs];
+            for (const a of list) {
+                if (isPrivateIp(a.address)) {
+                    const blockErr = new Error(`blocked_private_target:${a.address}`);
+                    blockErr.code = 'EBLOCKED';
+                    return cb(blockErr);
+                }
+            }
+            if (options && options.all) return cb(null, list);
+            return cb(null, list[0].address, list[0].family);
+        });
+    };
+
     try {
         // Build request headers with sensible defaults
         const headers = normalizeRequestHeaders(monitor.headers);
@@ -226,8 +252,16 @@ export async function checkHttp(monitor) {
             validateStatus: () => true,
         };
 
-        if (isHttps) {
-            const sslCheck = monitor.success_criteria?.ssl_check !== false;
+        const sslCheck = monitor.success_criteria?.ssl_check !== false;
+        if (!allowPrivate) {
+            // Build agents that BOTH enforce the guarded lookup (axios may
+            // redirect across http <-> https, so we attach both).
+            requestConfig.httpAgent = new http.Agent({ lookup: guardedLookup });
+            requestConfig.httpsAgent = new https.Agent({
+                rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
+                lookup: guardedLookup,
+            });
+        } else if (isHttps) {
             requestConfig.httpsAgent = new https.Agent({
                 rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
             });
@@ -235,8 +269,45 @@ export async function checkHttp(monitor) {
             requestConfig.httpAgent = new http.Agent();
         }
 
+        if (!allowPrivate) {
+            requestConfig.beforeRedirect = (options) => {
+                const href = options.href || (options.protocol && options.hostname
+                    ? `${options.protocol}//${options.hostname}${options.path || ''}`
+                    : null);
+                if (!href) return;
+                let next;
+                try { next = new URL(href); } catch { throw new Error('blocked_redirect_invalid'); }
+                if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+                    throw new Error('blocked_redirect_scheme');
+                }
+                if (ipaddr.isValid(next.hostname) && isPrivateIp(next.hostname)) {
+                    throw new Error('blocked_private_target');
+                }
+            };
+        }
+
         if (monitor.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
             requestConfig.data = monitor.body;
+        }
+
+        // Pre-flight SSRF check on the initial URL before any socket work.
+        if (!allowPrivate) {
+            let urlObj;
+            try { urlObj = new URL(monitor.url); }
+            catch {
+                result.error_type = 'validation';
+                result.error_message = 'Malformed monitor URL';
+                return result;
+            }
+            const check = await resolveAndCheck(urlObj.hostname);
+            if (!check.ok && check.reason === 'blocked_private_target') {
+                result.response_time_ms = Date.now() - startTime;
+                result.error_type = 'blocked_private_target';
+                result.error_message = `Target ${urlObj.hostname} resolves to a private/reserved IP (${check.ip})`;
+                logger.warn({ monitor_id: monitor.id, hostname: urlObj.hostname, ip: check.ip }, '[HTTP] Blocked private target');
+                return result;
+            }
+            // Note: dns_failure passes through; the actual request will surface ENOTFOUND/EAI_AGAIN normally
         }
 
         // Make the request
@@ -382,7 +453,17 @@ export async function checkHttp(monitor) {
                 // Fallback: raw TLS connect (only if socket cert unavailable)
                 if (!cert || !cert.valid_to) {
                     const urlObj = new URL(finalUrl || monitor.url);
-                    cert = await fetchCertificate(urlObj.hostname, parseInt(urlObj.port) || 443);
+                    if (!allowPrivate) {
+                        const tlsCheck = await resolveAndCheck(urlObj.hostname);
+                        if (!tlsCheck.ok && tlsCheck.reason === 'blocked_private_target') {
+                            logger.warn({ monitor_id: monitor.id, hostname: urlObj.hostname }, '[HTTP] Skipping TLS fallback for private host');
+                            // Skip fetchCertificate; cert info remains absent.
+                        } else {
+                            cert = await fetchCertificate(urlObj.hostname, parseInt(urlObj.port) || 443);
+                        }
+                    } else {
+                        cert = await fetchCertificate(urlObj.hostname, parseInt(urlObj.port) || 443);
+                    }
                 }
 
                 if (cert && cert.valid_to) {
@@ -429,7 +510,12 @@ export async function checkHttp(monitor) {
         const code = error.code || '';
         const message = error.message || '';
 
-        if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || code === 'ERR_SOCKET_CONNECTION_TIMEOUT') {
+        if (code === 'EBLOCKED' || message.includes('blocked_private_target') || message.includes('blocked_redirect')) {
+            result.error_type = 'blocked_private_target';
+            result.error_message = message.includes('blocked_redirect_scheme')
+                ? 'Redirect target uses a disallowed scheme'
+                : 'Target resolves to a private/reserved IP address';
+        } else if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || code === 'ERR_SOCKET_CONNECTION_TIMEOUT') {
             result.error_type = 'timeout';
             result.error_message = `Connection timed out after ${monitor.timeout || DEFAULT_MONITOR_TIMEOUT_S}s`;
         } else if (code === 'ENOTFOUND') {

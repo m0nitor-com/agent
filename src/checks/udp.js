@@ -1,9 +1,13 @@
 import dgram from 'dgram';
+import { logger } from '../lib/logger.js';
+import { config as appConfig } from '../lib/config.js';
+import { resolveAndCheck } from '../lib/ssrf.js';
 
 /**
  * Perform UDP port check on a monitor
  */
 export async function checkUdp(monitor) {
+    const startTime = Date.now();
     const result = {
         monitor_id: monitor.id,
         is_success: false,
@@ -12,23 +16,34 @@ export async function checkUdp(monitor) {
         error_type: null,
     };
 
-    return new Promise((resolve) => {
-        const startTime = Date.now();
-        let resolved = false;
+    // Extract host and port up-front so we can run the SSRF pre-flight.
+    let host = monitor.url;
+    let port = monitor.port || 53; // Default to DNS port if not specified
 
-        // Extract host and port
-        let host = monitor.url;
-        let port = monitor.port || 53; // Default to DNS port if not specified
-
-        try {
-            if (host.includes('://')) {
-                const url = new URL(monitor.url);
-                host = url.hostname;
-                port = monitor.port || parseInt(url.port) || 53;
-            }
-        } catch {
-            // host is likely just an IP or hostname
+    try {
+        if (host.includes('://')) {
+            const url = new URL(monitor.url);
+            host = url.hostname;
+            port = monitor.port || parseInt(url.port) || 53;
         }
+    } catch {
+        // host is likely just an IP or hostname
+    }
+
+    const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
+    if (!allowPrivate) {
+        const check = await resolveAndCheck(host);
+        if (!check.ok && check.reason === 'blocked_private_target') {
+            result.response_time_ms = Date.now() - startTime;
+            result.error_type = 'blocked_private_target';
+            result.error_message = `Target ${host} resolves to a private/reserved IP (${check.ip})`;
+            logger.warn({ monitor_id: monitor.id, host, ip: check.ip }, '[UDP] Blocked private target');
+            return result;
+        }
+    }
+
+    return new Promise((resolve) => {
+        let resolved = false;
 
         const client = dgram.createSocket('udp4');
         const timeout = (monitor.timeout || 10) * 1000;
