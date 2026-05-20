@@ -16,3 +16,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Track Node LTS lines only. Odd-numbered Node majors are short-lived
+      # (active for ~6 months, no maintenance window) and unsafe for prod images.
+      - dependency-name: "node"
+        versions: ["21.x", "23.x", "25.x", "27.x", "29.x", "31.x"]
