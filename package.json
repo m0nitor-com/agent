@@ -17,7 +17,7 @@
         "envalid": "^8.0.0",
         "ipaddr.js": "^2.2.0",
         "ping": "^0.4.4",
-        "pino": "^8.19.0",
+        "pino": "^10.3.1",
         "ssl-checker": "^2.0.8"
     },
     "devDependencies": {
