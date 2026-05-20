@@ -1,5 +1,5 @@
-# Use Node.js 20 Alpine for a small footprint
-FROM node:20.19-alpine
+# Use Node.js 24 Alpine (Active LTS) for a small footprint
+FROM node:24-alpine
 
 # Set working directory
 WORKDIR /app
