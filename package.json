@@ -22,9 +22,9 @@
     },
     "devDependencies": {
         "eslint": "^8.56.0",
-        "nodemon": "^3.0.2",
+        "nodemon": "^3.1.14",
         "pino-pretty": "^10.3.1",
-        "vitest": "^4.1.4"
+        "vitest": "^4.1.7"
     },
     "engines": {
         "node": ">=20.0.0"
