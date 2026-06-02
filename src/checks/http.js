@@ -477,21 +477,26 @@ export async function checkHttp(monitor) {
                         valid: isValid,
                         days_remaining: daysRemaining,
                         issuer: cert.issuer?.O || cert.issuer?.CN || 'Unknown',
-                        valid_from: cert.valid_from,
-                        valid_to: cert.valid_to,
+                        subject: cert.subject?.CN || cert.subject?.O || undefined,
+                        expires_at: validTo.toISOString(),
                     };
 
                     const minDays = criteria.ssl_min_days || DEFAULT_SSL_MIN_DAYS;
                     if (!isValid) {
                         result.is_success = false;
-                        result.error_type = 'ssl';
-                        result.error_message = 'SSL certificate is invalid';
+                        if (now > validTo) {
+                            result.error_type = 'ssl_expired';
+                            result.error_message = 'SSL certificate has expired';
+                        } else {
+                            result.error_type = 'ssl_not_yet_valid';
+                            result.error_message = 'SSL certificate is not yet valid';
+                        }
                         return result;
                     }
 
                     if (daysRemaining < minDays) {
                         result.is_success = false;
-                        result.error_type = 'ssl';
+                        result.error_type = 'ssl_expiring';
                         result.error_message = `SSL certificate expires in ${daysRemaining} days (min: ${minDays})`;
                         return result;
                     }
