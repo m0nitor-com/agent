@@ -351,4 +351,70 @@ describe('checkHttp', () => {
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('ssl_hostname');
     });
+
+    function mockHttpsResponse(cert) {
+        return mockResponse({
+            request: {
+                socket: {
+                    getPeerCertificate: () => cert,
+                },
+            },
+        });
+    }
+
+    const httpsMonitor = { ...baseMonitor, type: 'https' };
+
+    it('emits backend-canonical ssl_info (expires_at, no valid_to/valid_from) on a successful HTTPS check', async () => {
+        const validTo = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+        const validFrom = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        mockAxios.mockResolvedValue(mockHttpsResponse({
+            valid_to: validTo,
+            valid_from: validFrom,
+            issuer: { O: "Let's Encrypt", CN: 'R3' },
+            subject: { CN: 'example.com' },
+        }));
+
+        const result = await checkHttp(httpsMonitor);
+        expect(result.is_success).toBe(true);
+        expect(result.ssl_info.expires_at).toBe(validTo);
+        expect(result.ssl_info.days_remaining).toBeTypeOf('number');
+        expect(result.ssl_info.days_remaining).toBeGreaterThan(80);
+        expect(result.ssl_info.subject).toBe('example.com');
+        expect(result.ssl_info.issuer).toBe("Let's Encrypt");
+        expect(result.ssl_info).not.toHaveProperty('valid_to');
+        expect(result.ssl_info).not.toHaveProperty('valid_from');
+    });
+
+    it('reports ssl_expiring when a valid cert is below the minimum days threshold', async () => {
+        const validTo = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+        const validFrom = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        mockAxios.mockResolvedValue(mockHttpsResponse({
+            valid_to: validTo,
+            valid_from: validFrom,
+            issuer: { O: "Let's Encrypt" },
+            subject: { CN: 'example.com' },
+        }));
+
+        const result = await checkHttp(httpsMonitor);
+        expect(result.is_success).toBe(false);
+        expect(result.error_type).toBe('ssl_expiring');
+        expect(result.error_message).toContain('expires in');
+        expect(result.ssl_info.expires_at).toBe(validTo);
+    });
+
+    it('reports ssl_expired when the cert end date is in the past (success-path date check)', async () => {
+        const validTo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+        const validFrom = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+        mockAxios.mockResolvedValue(mockHttpsResponse({
+            valid_to: validTo,
+            valid_from: validFrom,
+            issuer: { O: "Let's Encrypt" },
+            subject: { CN: 'example.com' },
+        }));
+
+        const result = await checkHttp(httpsMonitor);
+        expect(result.is_success).toBe(false);
+        expect(result.error_type).toBe('ssl_expired');
+        expect(result.error_message).toBe('SSL certificate has expired');
+    });
 });
