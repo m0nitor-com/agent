@@ -70,18 +70,16 @@ describe('checkHttp', () => {
         expect(result.is_success).toBe(true);
     });
 
-    it('fails on response time exceeding limit', async () => {
-        // Simulate slow response by manipulating time
+    it('succeeds on a slow but valid response', async () => {
         mockAxios.mockImplementation(() =>
             new Promise(resolve => setTimeout(() => resolve(mockResponse()), 50))
         );
 
         const result = await checkHttp({
             ...baseMonitor,
-            success_criteria: { status_codes: [200], max_response_time: 0 },
+            success_criteria: { status_codes: [200] },
         });
-        expect(result.is_success).toBe(false);
-        expect(result.error_type).toBe('response_time');
+        expect(result.is_success).toBe(true);
     });
 
     it('fails when keyword not found in response', async () => {

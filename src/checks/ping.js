@@ -50,14 +50,6 @@ export async function checkPing(monitor) {
             const time = parseFloat(pingResult.time);
             result.response_time_ms = !isNaN(avg) ? Math.round(avg) : (!isNaN(time) ? Math.round(time) : 0);
             result.is_success = true;
-
-            // Check response time limit
-            const maxResponseTime = monitor.success_criteria?.max_response_time || 30000;
-            if (result.response_time_ms > maxResponseTime) {
-                result.is_success = false;
-                result.error_type = 'response_time';
-                result.error_message = `Ping time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
-            }
         } else {
             result.is_success = false;
 

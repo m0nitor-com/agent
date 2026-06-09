@@ -47,7 +47,6 @@ export async function checkUdp(monitor) {
 
         const client = dgram.createSocket('udp4');
         const timeout = (monitor.timeout || 10) * 1000;
-        const maxResponseTime = monitor.success_criteria?.max_response_time || 30000;
 
         const done = () => {
             if (resolved) return;
@@ -63,14 +62,6 @@ export async function checkUdp(monitor) {
             // indicates the port accepted or silently dropped the packet.
             result.is_success = true;
             result.response_time_ms = Date.now() - startTime;
-
-            // Check response time limit
-            if (result.response_time_ms > maxResponseTime) {
-                result.is_success = false;
-                result.error_type = 'response_time';
-                result.error_message = `UDP response time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
-            }
-
             done();
         }, timeout);
 
@@ -109,14 +100,6 @@ export async function checkUdp(monitor) {
         client.on('message', (_msg, _rinfo) => {
             result.is_success = true;
             result.response_time_ms = Date.now() - startTime;
-
-            // Check response time limit
-            if (result.response_time_ms > maxResponseTime) {
-                result.is_success = false;
-                result.error_type = 'response_time';
-                result.error_message = `UDP response time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
-            }
-
             done();
         });
 

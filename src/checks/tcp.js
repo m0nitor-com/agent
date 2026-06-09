@@ -6,7 +6,6 @@ import {
     DEFAULT_MONITOR_TIMEOUT_S,
     MAX_MONITOR_TIMEOUT_S,
     MIN_MONITOR_TIMEOUT_S,
-    DEFAULT_MAX_RESPONSE_TIME_MS,
 } from '../lib/constants.js';
 
 /**
@@ -56,16 +55,7 @@ export async function checkTcp(monitor) {
         // Named handlers for clean removal
         const onConnect = () => {
             result.response_time_ms = Date.now() - startTime;
-
-            const maxResponseTime = monitor.success_criteria?.max_response_time || DEFAULT_MAX_RESPONSE_TIME_MS;
-            if (result.response_time_ms > maxResponseTime) {
-                result.is_success = false;
-                result.error_type = 'response_time';
-                result.error_message = `Connection time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
-            } else {
-                result.is_success = true;
-            }
-
+            result.is_success = true;
             done();
         };
 

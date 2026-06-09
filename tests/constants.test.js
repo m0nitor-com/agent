@@ -6,9 +6,9 @@ describe('constants', () => {
         expect(constants.DEFAULT_MONITOR_TIMEOUT_S).toBe(30);
         expect(constants.MAX_MONITOR_TIMEOUT_S).toBe(300);
         expect(constants.MIN_MONITOR_TIMEOUT_S).toBe(1);
-        expect(constants.DEFAULT_MAX_RESPONSE_TIME_MS).toBe(30000);
         expect(constants.DNS_RESOLUTION_TIMEOUT_MS).toBe(5000);
         expect(constants.TLS_HANDSHAKE_TIMEOUT_MS).toBe(10000);
+        expect(constants.CHECK_WATCHDOG_BUFFER_MS).toBe(5000);
     });
 
     it('exports HTTP constants', () => {

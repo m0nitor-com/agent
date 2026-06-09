@@ -7,9 +7,12 @@
 export const DEFAULT_MONITOR_TIMEOUT_S = 30;
 export const MAX_MONITOR_TIMEOUT_S = 300;
 export const MIN_MONITOR_TIMEOUT_S = 1;
-export const DEFAULT_MAX_RESPONSE_TIME_MS = 30000;
 export const DNS_RESOLUTION_TIMEOUT_MS = 5000;
 export const TLS_HANDSHAKE_TIMEOUT_MS = 10000;
+// Backstop watchdog: a check is force-failed if it runs longer than its own
+// hard timeout plus this buffer. The buffer lets each check's internal timeout
+// fire first under normal conditions; the watchdog only catches true hangs.
+export const CHECK_WATCHDOG_BUFFER_MS = 5000;
 
 // --- HTTP ---
 export const MAX_RESPONSE_BODY_LENGTH = 10 * 1024 * 1024;  // 10 MB inbound

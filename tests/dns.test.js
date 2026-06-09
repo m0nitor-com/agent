@@ -155,17 +155,21 @@ describe('checkDns', () => {
         expect(result.is_success).toBe(true);
     });
 
-    it('fails on response time exceeding limit', async () => {
+    it('succeeds on a slow but valid resolution', async () => {
         mockResolver.resolve4.mockImplementation(() =>
             new Promise(resolve => setTimeout(() => resolve(['1.2.3.4']), 50))
         );
 
-        const result = await checkDns({
-            ...baseMonitor,
-            success_criteria: { max_response_time: -1 },
-        });
+        const result = await checkDns({ ...baseMonitor });
+        expect(result.is_success).toBe(true);
+    });
+
+    it('times out a hung query using the monitor timeout', async () => {
+        mockResolver.resolve4.mockImplementation(() => new Promise(() => {}));
+
+        const result = await checkDns({ ...baseMonitor, timeout: 1 });
         expect(result.is_success).toBe(false);
-        expect(result.error_type).toBe('response_time');
+        expect(result.error_type).toBe('timeout');
     });
 
     it('handles ENOTFOUND error', async () => {

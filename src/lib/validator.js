@@ -3,7 +3,6 @@ import {
     DEFAULT_MONITOR_TIMEOUT_S,
     MAX_MONITOR_TIMEOUT_S,
     MIN_MONITOR_TIMEOUT_S,
-    DEFAULT_MAX_RESPONSE_TIME_MS,
     DEFAULT_SSL_MIN_DAYS,
 } from './constants.js';
 
@@ -66,13 +65,6 @@ export function validateMonitor(raw) {
     const criteria = (raw.success_criteria && typeof raw.success_criteria === 'object')
         ? { ...raw.success_criteria }
         : {};
-
-    // Clamp max_response_time
-    let maxResponseTime = Number(criteria.max_response_time);
-    if (!Number.isFinite(maxResponseTime) || maxResponseTime <= 0) {
-        maxResponseTime = DEFAULT_MAX_RESPONSE_TIME_MS;
-    }
-    criteria.max_response_time = maxResponseTime;
 
     // Normalize ssl_min_days
     let sslMinDays = Number(criteria.ssl_min_days);

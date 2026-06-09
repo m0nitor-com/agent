@@ -6,17 +6,26 @@ import { resolveAndCheck } from '../lib/ssrf.js';
 import {
     DNS_RESOLUTION_TIMEOUT_MS,
     MAX_DNS_RECORDS,
-    DEFAULT_MAX_RESPONSE_TIME_MS,
+    DEFAULT_MONITOR_TIMEOUT_S,
 } from '../lib/constants.js';
+
+/**
+ * Race a promise against a timeout. The timer is always cleared so it never
+ * leaks or keeps the event loop alive after the promise settles.
+ */
+const withTimeout = (promise, timeout, message) => {
+    let timer;
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeout);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+};
 
 /**
  * Resolve a hostname with a timeout.
  */
 const resolveWithTimeout = (hostname, timeout = DNS_RESOLUTION_TIMEOUT_MS) => {
-    return Promise.race([
-        dns.resolve4(hostname),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('DNS resolution timeout')), timeout))
-    ]);
+    return withTimeout(dns.resolve4(hostname), timeout, 'DNS resolution timeout');
 };
 
 /**
@@ -47,7 +56,7 @@ async function checkDns(monitor) {
     const recordType = (monitor.method || 'A').toUpperCase();
     const expectedValue = monitor.success_criteria?.expected_value || null;
     const customServer = monitor.success_criteria?.dns_server || null;
-    const maxResponseTime = monitor.success_criteria?.max_response_time || DEFAULT_MAX_RESPONSE_TIME_MS;
+    const queryTimeoutMs = (monitor.timeout || DEFAULT_MONITOR_TIMEOUT_S) * 1000;
 
     try {
         let results = [];
@@ -86,43 +95,42 @@ async function checkDns(monitor) {
 
         const resolver = getResolver(resolverServers);
 
-        switch (recordType) {
-            case 'A':
-                results = await resolver.resolve4(hostname);
-                break;
-            case 'AAAA':
-                results = await resolver.resolve6(hostname);
-                break;
-            case 'MX':
-                results = await resolver.resolveMx(hostname);
-                results = results.map(r => `${r.exchange} (${r.priority})`);
-                break;
-            case 'TXT':
-                results = await resolver.resolveTxt(hostname);
-                results = results.flat();
-                break;
-            case 'NS':
-                results = await resolver.resolveNs(hostname);
-                break;
-            case 'CNAME':
-                results = await resolver.resolveCname(hostname);
-                break;
-            case 'SOA': {
-                const soa = await resolver.resolveSoa(hostname);
-                results = [`${soa.nsname} ${soa.hostmaster} ${soa.serial} ${soa.refresh} ${soa.retry} ${soa.expire} ${soa.minttl}`];
-                break;
+        // The underlying c-ares queries are not bound by the monitor's timeout,
+        // so race them against it to honor the configured hard limit.
+        const runQuery = async () => {
+            switch (recordType) {
+                case 'A':
+                    return await resolver.resolve4(hostname);
+                case 'AAAA':
+                    return await resolver.resolve6(hostname);
+                case 'MX': {
+                    const mx = await resolver.resolveMx(hostname);
+                    return mx.map(r => `${r.exchange} (${r.priority})`);
+                }
+                case 'TXT': {
+                    const txt = await resolver.resolveTxt(hostname);
+                    return txt.flat();
+                }
+                case 'NS':
+                    return await resolver.resolveNs(hostname);
+                case 'CNAME':
+                    return await resolver.resolveCname(hostname);
+                case 'SOA': {
+                    const soa = await resolver.resolveSoa(hostname);
+                    return [`${soa.nsname} ${soa.hostmaster} ${soa.serial} ${soa.refresh} ${soa.retry} ${soa.expire} ${soa.minttl}`];
+                }
+                case 'SRV': {
+                    const srv = await resolver.resolveSrv(hostname);
+                    return srv.map(s => `${s.name} ${s.port} ${s.priority} ${s.weight}`);
+                }
+                case 'PTR':
+                    return await resolver.reverse(hostname);
+                default:
+                    throw new Error(`Unsupported record type: ${recordType}`);
             }
-            case 'SRV': {
-                const srv = await resolver.resolveSrv(hostname);
-                results = srv.map(s => `${s.name} ${s.port} ${s.priority} ${s.weight}`);
-            }
-                break;
-            case 'PTR':
-                results = await resolver.reverse(hostname);
-                break;
-            default:
-                throw new Error(`Unsupported record type: ${recordType}`);
-        }
+        };
+
+        results = await withTimeout(runQuery(), queryTimeoutMs, 'DNS query timeout');
 
         const responseTime = Date.now() - start;
 
@@ -132,17 +140,6 @@ async function checkDns(monitor) {
             server: customServer || 'system',
             record_count: results.length,
         };
-
-        if (responseTime > maxResponseTime) {
-            return {
-                monitor_id: monitor.id,
-                is_success: false,
-                response_time_ms: responseTime,
-                error_type: 'response_time',
-                error_message: `DNS resolution took ${responseTime}ms (limit: ${maxResponseTime}ms)`,
-                dns_info: dnsInfo,
-            };
-        }
 
         if (expectedValue) {
             const match = results.some(val =>
@@ -181,7 +178,7 @@ async function checkDns(monitor) {
         } else if (code === 'ESERVFAIL') {
             errorType = 'dns_servfail';
             errorMessage = `DNS server failed to resolve ${hostname} (SERVFAIL)`;
-        } else if (code === 'ETIMEOUT' || code === 'TIMEOUT') {
+        } else if (code === 'ETIMEOUT' || code === 'TIMEOUT' || (error.message || '').toLowerCase().includes('timeout')) {
             errorType = 'timeout';
             errorMessage = `DNS resolution timed out for ${hostname}`;
         } else if (code === 'EREFUSED' || code === 'ECONNREFUSED') {

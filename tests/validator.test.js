@@ -59,14 +59,8 @@ describe('validateMonitor', () => {
     it('normalizes success_criteria to empty object when invalid', () => {
         const result = validateMonitor({ ...validMonitor, success_criteria: 'invalid' });
         expect(result.success_criteria).toEqual({
-            max_response_time: 30000,
             ssl_min_days: 7,
         });
-    });
-
-    it('sets default max_response_time when missing', () => {
-        const result = validateMonitor({ ...validMonitor, success_criteria: {} });
-        expect(result.success_criteria.max_response_time).toBe(30000);
     });
 
     it('filters invalid status codes', () => {

@@ -3,7 +3,11 @@ import { logger } from './lib/logger.js';
 import ApiClient from './lib/api.js';
 import { validateMonitor } from './lib/validator.js';
 import { ResultQueue } from './lib/result-queue.js';
-import { HEALTH_UNHEALTHY_AFTER_FAILED_POLLS } from './lib/constants.js';
+import {
+    HEALTH_UNHEALTHY_AFTER_FAILED_POLLS,
+    CHECK_WATCHDOG_BUFFER_MS,
+    DEFAULT_MONITOR_TIMEOUT_S,
+} from './lib/constants.js';
 import { computeNextPollDelay } from './lib/backoff.js';
 import checkHttp from './checks/http.js';
 import checkPing from './checks/ping.js';
@@ -56,6 +60,28 @@ let totalChecks = 0;
 let latestAvailableVersion = null;
 
 /**
+ * Run a check, force-failing it if it outlives its hard timeout plus a buffer.
+ * This is a backstop: each check enforces its own timeout, but a bug or a hung
+ * socket must never block a concurrency slot indefinitely.
+ */
+function runWithWatchdog(checkFn, monitor) {
+    const timeoutMs = (monitor.timeout || DEFAULT_MONITOR_TIMEOUT_S) * 1000 + CHECK_WATCHDOG_BUFFER_MS;
+    let timer;
+    const watchdog = new Promise((resolve) => {
+        timer = setTimeout(() => {
+            logger.warn({ monitor_id: monitor.id, type: monitor.type, timeout_ms: timeoutMs }, '[CHECK] Watchdog fired, force-failing hung check');
+            resolve({
+                monitor_id: monitor.id,
+                is_success: false,
+                error_type: 'timeout',
+                error_message: `Check did not complete within ${timeoutMs}ms`,
+            });
+        }, timeoutMs);
+    });
+    return Promise.race([checkFn(monitor), watchdog]).finally(() => clearTimeout(timer));
+}
+
+/**
  * Execute a check based on monitor type
  */
 async function executeCheck(monitor) {
@@ -67,20 +93,20 @@ async function executeCheck(monitor) {
         switch (monitor.type) {
             case 'http':
             case 'https':
-                result = await checkHttp(monitor);
+                result = await runWithWatchdog(checkHttp, monitor);
                 break;
             case 'ping':
-                result = await checkPing(monitor);
+                result = await runWithWatchdog(checkPing, monitor);
                 break;
             case 'tcp':
             case 'ssh':
-                result = await checkTcp(monitor);
+                result = await runWithWatchdog(checkTcp, monitor);
                 break;
             case 'udp':
-                result = await checkUdp(monitor);
+                result = await runWithWatchdog(checkUdp, monitor);
                 break;
             case 'dns':
-                result = await checkDns(monitor);
+                result = await runWithWatchdog(checkDns, monitor);
                 break;
             default:
                 logger.warn(`[CHECK] Unknown monitor type: ${monitor.type}`);

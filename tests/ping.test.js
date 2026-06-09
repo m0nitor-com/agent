@@ -66,7 +66,7 @@ describe('checkPing', () => {
         expect(result.response_time_ms).toBe(0);
     });
 
-    it('fails on response time exceeding limit', async () => {
+    it('succeeds regardless of how slow the ping is', async () => {
         mockProbe.mockResolvedValue({
             alive: true,
             avg: '35000',
@@ -74,8 +74,8 @@ describe('checkPing', () => {
         });
 
         const result = await checkPing(baseMonitor);
-        expect(result.is_success).toBe(false);
-        expect(result.error_type).toBe('response_time');
+        expect(result.is_success).toBe(true);
+        expect(result.response_time_ms).toBe(35000);
     });
 
     it('returns host_unreachable error', async () => {

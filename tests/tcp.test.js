@@ -144,15 +144,12 @@ describe('checkTcp', () => {
         expect(result.error_type).toBe('unknown');
     });
 
-    it('fails on response time exceeding limit', async () => {
-        const promise = checkTcp({
-            ...baseMonitor,
-            success_criteria: { max_response_time: -1 },
-        });
+    it('succeeds on connect regardless of how slow it was', async () => {
+        const promise = checkTcp({ ...baseMonitor });
         process.nextTick(() => mockSocket.emit('connect'));
         const result = await promise;
-        expect(result.is_success).toBe(false);
-        expect(result.error_type).toBe('response_time');
+        expect(result.is_success).toBe(true);
+        expect(result.error_type).toBeNull();
     });
 
     it('extracts host from plain hostname', async () => {

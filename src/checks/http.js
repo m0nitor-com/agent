@@ -16,7 +16,6 @@ import {
     DEFAULT_HTTP_METHOD,
     DEFAULT_ACCEPTED_STATUS_CODES,
     DEFAULT_SSL_MIN_DAYS,
-    DEFAULT_MAX_RESPONSE_TIME_MS,
     TLS_HANDSHAKE_TIMEOUT_MS,
     MIN_MONITOR_TIMEOUT_S,
     MAX_MONITOR_TIMEOUT_S,
@@ -347,21 +346,11 @@ export async function checkHttp(monitor) {
             ? criteria.status_codes.map((code) => Number(code)).filter((code) => Number.isFinite(code))
             : [];
         const resolvedAcceptedCodes = acceptedCodes.length > 0 ? acceptedCodes : DEFAULT_ACCEPTED_STATUS_CODES;
-        const maxResponseTime = Number.isFinite(Number(criteria.max_response_time))
-            ? Number(criteria.max_response_time)
-            : DEFAULT_MAX_RESPONSE_TIME_MS;
 
         if (!resolvedAcceptedCodes.includes(response.status)) {
             result.is_success = false;
             result.error_type = 'status_code';
             result.error_message = `Expected status ${resolvedAcceptedCodes.join('/')}, got ${response.status}`;
-            return result;
-        }
-
-        if (result.response_time_ms > maxResponseTime) {
-            result.is_success = false;
-            result.error_type = 'response_time';
-            result.error_message = `Response time ${result.response_time_ms}ms exceeds limit ${maxResponseTime}ms`;
             return result;
         }
 
