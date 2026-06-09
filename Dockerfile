@@ -4,6 +4,12 @@ FROM node:24-alpine
 # Set working directory
 WORKDIR /app
 
+# Install a real ping (iputils) and grant it the NET_RAW capability so the
+# non-root user can send ICMP. Docker keeps NET_RAW in its default capability
+# set, so this works without any runtime --cap-add or --sysctl flag.
+RUN apk add --no-cache iputils libcap \
+    && setcap cap_net_raw+ep "$(command -v ping)"
+
 # Copy package files
 COPY package*.json ./
 

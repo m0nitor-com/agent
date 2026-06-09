@@ -122,6 +122,17 @@ describe('checkPing', () => {
         expect(result.error_type).toBe('network_unreachable');
     });
 
+    it('returns permission error when ICMP is not permitted', async () => {
+        mockProbe.mockResolvedValue({
+            alive: false,
+            output: 'ping: permission denied (are you root?)',
+        });
+
+        const result = await checkPing(baseMonitor);
+        expect(result.is_success).toBe(false);
+        expect(result.error_type).toBe('permission');
+    });
+
     it('returns generic connection error for unknown output', async () => {
         mockProbe.mockResolvedValue({
             alive: false,

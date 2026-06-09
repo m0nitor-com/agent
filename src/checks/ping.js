@@ -75,6 +75,9 @@ export async function checkPing(monitor) {
             } else if (output.includes('unknown host') || output.includes('could not find host')) {
                 result.error_type = 'dns';
                 result.error_message = `DNS resolution failed for ${host}`;
+            } else if (output.includes('permission denied') || output.includes('operation not permitted') || output.includes('are you root')) {
+                result.error_type = 'permission';
+                result.error_message = 'Probe lacks permission to send ICMP. The agent needs the NET_RAW capability (or net.ipv4.ping_group_range) to run ping checks.';
             } else {
                 result.error_type = 'connection';
                 result.error_message = `Host ${host} is not responding to ping`;

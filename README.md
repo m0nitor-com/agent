@@ -19,10 +19,17 @@ Run the worker using the pre-built Docker image.
 docker run -d \
   --name m0nitor-agent \
   --restart always \
-  -e API_URL="https://console.m0nitor.com/api" \
+  -e API_URL="https://m0nitor.com/api" \
   -e PROBE_TOKEN="your-probe-token-here" \
   ghcr.io/m0nitor-com/agent:latest
 ```
+
+> ℹ️ **Ping (ICMP) checks**: The image grants its `ping` binary the `NET_RAW`
+> capability, which Docker keeps in its default capability set, so ICMP checks
+> work out of the box. If your host or orchestrator drops capabilities (e.g.
+> `--cap-drop=ALL`, restrictive Kubernetes `securityContext`), re-add it with
+> `--cap-add=NET_RAW`. As an alternative you can pass
+> `--sysctl net.ipv4.ping_group_range="0 2147483647"`.
 
 ### Option 2: Docker Compose
 
@@ -35,9 +42,15 @@ services:
     image: ghcr.io/m0nitor-com/agent:latest
     restart: always
     environment:
-      - API_URL=https://console.m0nitor.com/api
+      - API_URL=https://m0nitor.com/api
       - PROBE_TOKEN=your-probe-token-here
       - LOG_LEVEL=info
+    # Ping (ICMP) works by default. If your environment drops capabilities,
+    # uncomment one of the following:
+    # cap_add:
+    #   - NET_RAW
+    # sysctls:
+    #   - net.ipv4.ping_group_range=0 2147483647
 ```
 
 Then run:
