@@ -37,6 +37,9 @@ export const DEFAULT_CONCURRENCY_LIMIT = 30;
 export const RESULT_QUEUE_MAX_SIZE = 1000;
 export const RESULT_QUEUE_RETRY_INTERVAL_MS = 15000; // 15 seconds
 export const RESULT_QUEUE_MAX_RETRIES = 5;
+// Max results per batched report request. Larger chunks are split so a single
+// request stays well under the API's server-side cap.
+export const MAX_REPORT_BATCH_SIZE = 100;
 
 // --- Health ---
 export const DEFAULT_HEALTH_PORT = 8080;

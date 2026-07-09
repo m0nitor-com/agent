@@ -1,5 +1,5 @@
 import { logger } from './logger.js';
-import { RESULT_QUEUE_MAX_SIZE, RESULT_QUEUE_RETRY_INTERVAL_MS, RESULT_QUEUE_MAX_RETRIES } from './constants.js';
+import { RESULT_QUEUE_MAX_SIZE, RESULT_QUEUE_RETRY_INTERVAL_MS, RESULT_QUEUE_MAX_RETRIES, MAX_REPORT_BATCH_SIZE } from './constants.js';
 
 /**
  * In-memory result queue that buffers failed report submissions
@@ -27,6 +27,36 @@ export class ResultQueue {
             this.enqueue(result);
             return false;
         }
+    }
+
+    /**
+     * Submit a batch of results in as few requests as possible. Each chunk that
+     * fails is broken back into individual results on the retry queue, so a batch
+     * failure degrades to the same per-result retry path as the single submit().
+     * @returns {boolean} true if every chunk was reported immediately
+     */
+    async submitBatch(results) {
+        if (!Array.isArray(results) || results.length === 0) {
+            return true;
+        }
+
+        let allReported = true;
+
+        for (let i = 0; i < results.length; i += MAX_REPORT_BATCH_SIZE) {
+            const chunk = results.slice(i, i + MAX_REPORT_BATCH_SIZE);
+            try {
+                await this.api.reportBatch(chunk);
+            } catch (error) {
+                logger.warn({ count: chunk.length, err: error },
+                    '[QUEUE] Batch report failed, enqueueing results for retry');
+                for (const result of chunk) {
+                    this.enqueue(result);
+                }
+                allReported = false;
+            }
+        }
+
+        return allReported;
     }
 
     /**

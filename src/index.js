@@ -197,13 +197,14 @@ async function pollAndCheck() {
                 })
             );
 
-            // Report results via queue (auto-retries on failure)
+            // Report the whole chunk in one batched request. A failed batch falls
+            // back to per-result retries via the result queue.
             for (const result of results) {
                 const status = result.is_success ? '✓' : '✗';
                 logger.info(`[REPORT] ${status} Monitor #${result.monitor_id}: ${result.response_time_ms || 0}ms`);
-                await resultQueue.submit(result);
                 totalChecks++;
             }
+            await resultQueue.submitBatch(results);
         }
 
     } catch (error) {

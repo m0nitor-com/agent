@@ -101,4 +101,14 @@ describe('ApiClient', () => {
             expect(result).toEqual({ ok: true });
         });
     });
+
+    describe('reportBatch', () => {
+        it('calls POST /workers/report-batch with a reports wrapper', async () => {
+            const reports = [{ monitor_id: 1, is_success: true }, { monitor_id: 2, is_success: false }];
+            client.client.post = vi.fn().mockResolvedValue({ data: { success: true } });
+            const result = await client.reportBatch(reports);
+            expect(client.client.post).toHaveBeenCalledWith('/workers/report-batch', { reports });
+            expect(result).toEqual({ success: true });
+        });
+    });
 });

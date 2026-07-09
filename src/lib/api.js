@@ -101,6 +101,16 @@ class ApiClient {
             return response.data;
         }, 'reportCheck');
     }
+
+    /**
+     * Report a batch of check results to the backend in a single request.
+     */
+    async reportBatch(results) {
+        return this.withRetry(async () => {
+            const response = await this.client.post('/workers/report-batch', { reports: results });
+            return response.data;
+        }, 'reportBatch');
+    }
 }
 
 export default ApiClient;

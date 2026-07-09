@@ -8,6 +8,7 @@ describe('ResultQueue', () => {
     beforeEach(() => {
         mockApi = {
             reportCheck: vi.fn(),
+            reportBatch: vi.fn(),
         };
         queue = new ResultQueue(mockApi);
     });
@@ -31,6 +32,30 @@ describe('ResultQueue', () => {
         const submitted = await queue.submit(fakeResult);
         expect(submitted).toBe(false);
         expect(queue.size).toBe(1);
+    });
+
+    it('submits a whole chunk in a single request when the API succeeds', async () => {
+        mockApi.reportBatch.mockResolvedValue({});
+        const r2 = { monitor_id: 2, is_success: false };
+        const submitted = await queue.submitBatch([fakeResult, r2]);
+        expect(submitted).toBe(true);
+        expect(mockApi.reportBatch).toHaveBeenCalledTimes(1);
+        expect(mockApi.reportBatch).toHaveBeenCalledWith([fakeResult, r2]);
+        expect(mockApi.reportCheck).not.toHaveBeenCalled();
+        expect(queue.size).toBe(0);
+    });
+
+    it('enqueues each result for retry when the batch fails', async () => {
+        mockApi.reportBatch.mockRejectedValue(new Error('Network error'));
+        const submitted = await queue.submitBatch([fakeResult, { monitor_id: 2, is_success: true }]);
+        expect(submitted).toBe(false);
+        expect(queue.size).toBe(2);
+    });
+
+    it('returns true for an empty batch without calling the API', async () => {
+        const submitted = await queue.submitBatch([]);
+        expect(submitted).toBe(true);
+        expect(mockApi.reportBatch).not.toHaveBeenCalled();
     });
 
     it('limits queue size and drops oldest', () => {
