@@ -1,12 +1,22 @@
 import net from 'net';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
-import { resolveAndCheck } from '../lib/ssrf.js';
+import { resolveAndCheck, effectiveFamily, familyLabel } from '../lib/ssrf.js';
 import {
     DEFAULT_MONITOR_TIMEOUT_S,
     MAX_MONITOR_TIMEOUT_S,
     MIN_MONITOR_TIMEOUT_S,
 } from '../lib/constants.js';
+
+/**
+ * Parse "[ipv6]:port" or "[ipv6]" literals that new URL() cannot handle when the
+ * target has no scheme. Returns null when the input is not a bracketed literal.
+ */
+function parseBracketedLiteral(raw) {
+    const m = /^\[([0-9a-fA-F:]+)\](?::(\d+))?$/.exec(String(raw).trim());
+    if (!m) return null;
+    return { host: m[1], port: m[2] ? parseInt(m[2], 10) : null };
+}
 
 /**
  * Perform TCP port check on a monitor
@@ -19,6 +29,8 @@ export async function checkTcp(monitor) {
         response_time_ms: null,
         error_message: null,
         error_type: null,
+        resolved_ip: null,
+        family: null,
     };
 
     // Extract host and port up-front so we can run the SSRF pre-flight.
@@ -30,20 +42,40 @@ export async function checkTcp(monitor) {
         host = url.hostname;
         port = monitor.port || parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
     } catch {
-        // url is likely just an IP or hostname
+        // Not a URL — may be a bare host, or a bracketed IPv6 literal like [::1]:443.
+        const bracketed = parseBracketedLiteral(monitor.url);
+        if (bracketed) {
+            host = bracketed.host;
+            port = monitor.port || bracketed.port || 80;
+        }
     }
 
     const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
-    if (!allowPrivate) {
-        const check = await resolveAndCheck(host);
-        if (!check.ok && check.reason === 'blocked_private_target') {
-            result.response_time_ms = Date.now() - startTime;
+    const family = effectiveFamily(monitor.family, appConfig.IP_FAMILY);
+
+    // Resolve + SSRF pre-flight, and pin the validated IP so the socket cannot be
+    // re-resolved to a different (private) address between check and connect.
+    const check = await resolveAndCheck(host, { family, allowPrivate });
+    if (!check.ok) {
+        result.response_time_ms = Date.now() - startTime;
+        if (check.reason === 'blocked_private_target') {
             result.error_type = 'blocked_private_target';
             result.error_message = `Target ${host} resolves to a private/reserved IP (${check.ip})`;
             logger.warn({ monitor_id: monitor.id, host, ip: check.ip }, '[TCP] Blocked private target');
-            return result;
+        } else if (check.reason === 'family_unavailable') {
+            result.error_type = 'family_unavailable';
+            result.error_message = `No ${family} address available for ${host}`;
+        } else {
+            const code = check.error?.code || '';
+            result.error_type = code === 'EAI_AGAIN' ? 'dns_temporary' : 'dns';
+            result.error_message = `DNS resolution failed for ${host}`;
         }
+        return result;
     }
+
+    const target = check.ip;
+    result.resolved_ip = target;
+    result.family = familyLabel(check.family);
 
     return new Promise((resolve) => {
         let resolved = false;
@@ -120,7 +152,8 @@ export async function checkTcp(monitor) {
         socket.on('connect', onConnect);
         socket.on('timeout', onTimeout);
         socket.on('error', onError);
-        socket.connect(port, host);
+        // Connect to the validated IP literal (family is implied by the address).
+        socket.connect({ host: target, port, family: check.family });
     });
 }
 

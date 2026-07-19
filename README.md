@@ -4,7 +4,8 @@ This is the distributed worker agent for [m0nitor.com](https://m0nitor.com). It 
 
 ## Features
 
-- **Protocol Support**: HTTP(S), Ping (ICMP), TCP, UDP, DNS.
+- **Protocol Support**: HTTP(S), Ping (ICMP/ICMPv6), TCP, UDP, DNS.
+- **Dual-Stack**: IPv4 and IPv6 targets, with an optional per-check or global address-family preference.
 - **Secure**: Uses token-based authentication with the m0nitor API.
 - **Lightweight**: Optimized Node.js architecture with minimal footprint.
 - **Containerized**: Ready for Docker and Kubernetes deployments.
@@ -24,9 +25,9 @@ docker run -d \
   ghcr.io/m0nitor-com/agent:latest
 ```
 
-> ℹ️ **Ping (ICMP) checks**: The image grants its `ping` binary the `NET_RAW`
-> capability, which Docker keeps in its default capability set, so ICMP checks
-> work out of the box. If your host or orchestrator drops capabilities (e.g.
+> ℹ️ **Ping (ICMP/ICMPv6) checks**: The image grants its `ping` binary the `NET_RAW`
+> capability, which Docker keeps in its default capability set, so ICMP and ICMPv6
+> checks work out of the box. If your host or orchestrator drops capabilities (e.g.
 > `--cap-drop=ALL`, restrictive Kubernetes `securityContext`), re-add it with
 > `--cap-add=NET_RAW`. As an alternative you can pass
 > `--sysctl net.ipv4.ping_group_range="0 2147483647"`.
@@ -60,7 +61,7 @@ docker-compose up -d
 
 ### Option 3: Manual Installation (Node.js)
 
-**Prerequisites**: Node.js 20 LTS or newer.
+**Prerequisites**: Node.js 22 or newer.
 
 1. **Clone the repository**:
    ```bash
@@ -98,7 +99,10 @@ All configuration is done via environment variables.
 | `POLL_INTERVAL`| Time between check cycles in milliseconds | `5000` |
 | `POLL_MAX_INTERVAL` | Cap for exponential backoff under consecutive poll failures (ms). Worker rate-limits its API polls when the console is unreachable, capping the delay here. Set equal to `POLL_INTERVAL` to disable backoff. | `300000` |
 | `SKIP_SSL_VERIFY` | Skip SSL certificate verification (**INSECURE**) | `false` |
-| `ALLOW_PRIVATE_TARGETS` | Global override for the SSRF guard — when `true`, the worker will accept monitor targets that resolve to private/reserved IP ranges (RFC1918, loopback, link-local, etc.). Intended for self-hosted operators monitoring trusted LAN. Per-monitor opt-in via `monitor.allow_private_target` (Business+ plan-gated on the console) takes precedence. **Leave `false` for SaaS / untrusted environments.** | `false` |
+| `ALLOW_PRIVATE_TARGETS` | Global override for the SSRF guard — when `true`, the worker will accept monitor targets that resolve to private/reserved IP ranges (RFC1918, loopback, link-local, IPv6 ULA/link-local, etc.). Intended for self-hosted operators monitoring a trusted LAN. A per-monitor `allow_private_target` flag takes precedence. **Leave `false` unless you trust every monitor target.** | `false` |
+| `IP_FAMILY` | Default address family for checks when a monitor does not request one (`auto`, `ipv4`, `ipv6`). `auto` lets the OS choose; a per-monitor family always takes precedence. | `auto` |
+| `HEALTH_PORT` | Port for the built-in health-check HTTP server (`/health`). | `8080` |
+| `CONCURRENCY_LIMIT` | Maximum number of checks executed concurrently per poll cycle. | `30` |
 
 > ⚠️ **Security Warnings**:
 > - Only set `SKIP_SSL_VERIFY=true` in development environments with self-signed certificates. Never use this in production as it allows man-in-the-middle attacks.

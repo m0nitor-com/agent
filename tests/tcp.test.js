@@ -7,7 +7,14 @@ vi.mock('../src/lib/logger.js', () => ({
 
 // SSRF guard OFF for this suite so existing tests run unimpeded.
 vi.mock('../src/lib/config.js', () => ({
-    config: { ALLOW_PRIVATE_TARGETS: true },
+    config: { ALLOW_PRIVATE_TARGETS: true, IP_FAMILY: 'auto' },
+}));
+
+// Pin resolution so the check connects to a deterministic IP without real DNS.
+vi.mock('../src/lib/ssrf.js', () => ({
+    resolveAndCheck: vi.fn(async () => ({ ok: true, ip: '93.184.216.34', family: 4 })),
+    effectiveFamily: () => undefined,
+    familyLabel: (v) => (v === 6 ? 'ipv6' : 'ipv4'),
 }));
 
 let mockSocket;
@@ -42,6 +49,17 @@ vi.mock('net', () => ({
 
 const { checkTcp } = await import('../src/checks/tcp.js');
 
+// The check now runs an async resolve/pin step before creating the socket, so we
+// must wait until connect() has been called before emitting socket events.
+async function emitWhenConnected(event, arg) {
+    await vi.waitFor(() => {
+        if (!mockSocket || mockSocket.connect.mock.calls.length === 0) {
+            throw new Error('socket not connected yet');
+        }
+    });
+    mockSocket.emit(event, arg);
+}
+
 describe('checkTcp', () => {
     beforeEach(() => {
         vi.clearAllMocks();
@@ -54,18 +72,20 @@ describe('checkTcp', () => {
         success_criteria: { max_response_time: 30000 },
     };
 
-    it('returns success on connect', async () => {
+    it('returns success on connect and reports the resolved IP/family', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => mockSocket.emit('connect'));
+        await emitWhenConnected('connect');
         const result = await promise;
         expect(result.is_success).toBe(true);
         expect(result.monitor_id).toBe(1);
         expect(result.response_time_ms).toBeTypeOf('number');
+        expect(result.resolved_ip).toBe('93.184.216.34');
+        expect(result.family).toBe('ipv4');
     });
 
     it('returns timeout error on socket timeout', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => mockSocket.emit('timeout'));
+        await emitWhenConnected('timeout');
         const result = await promise;
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('timeout');
@@ -73,11 +93,9 @@ describe('checkTcp', () => {
 
     it('returns connection error on ECONNREFUSED', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => {
-            const err = new Error('Connection refused');
-            err.code = 'ECONNREFUSED';
-            mockSocket.emit('error', err);
-        });
+        const err = new Error('Connection refused');
+        err.code = 'ECONNREFUSED';
+        await emitWhenConnected('error', err);
         const result = await promise;
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('connection');
@@ -86,11 +104,9 @@ describe('checkTcp', () => {
 
     it('returns dns error on ENOTFOUND', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => {
-            const err = new Error('Not found');
-            err.code = 'ENOTFOUND';
-            mockSocket.emit('error', err);
-        });
+        const err = new Error('Not found');
+        err.code = 'ENOTFOUND';
+        await emitWhenConnected('error', err);
         const result = await promise;
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('dns');
@@ -98,11 +114,9 @@ describe('checkTcp', () => {
 
     it('returns connection_reset on ECONNRESET', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => {
-            const err = new Error('Reset');
-            err.code = 'ECONNRESET';
-            mockSocket.emit('error', err);
-        });
+        const err = new Error('Reset');
+        err.code = 'ECONNRESET';
+        await emitWhenConnected('error', err);
         const result = await promise;
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('connection_reset');
@@ -110,11 +124,9 @@ describe('checkTcp', () => {
 
     it('returns host_unreachable on EHOSTUNREACH', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => {
-            const err = new Error('Unreachable');
-            err.code = 'EHOSTUNREACH';
-            mockSocket.emit('error', err);
-        });
+        const err = new Error('Unreachable');
+        err.code = 'EHOSTUNREACH';
+        await emitWhenConnected('error', err);
         const result = await promise;
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('host_unreachable');
@@ -122,11 +134,9 @@ describe('checkTcp', () => {
 
     it('returns network_unreachable on ENETUNREACH', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => {
-            const err = new Error('Network unreachable');
-            err.code = 'ENETUNREACH';
-            mockSocket.emit('error', err);
-        });
+        const err = new Error('Network unreachable');
+        err.code = 'ENETUNREACH';
+        await emitWhenConnected('error', err);
         const result = await promise;
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('network_unreachable');
@@ -134,11 +144,9 @@ describe('checkTcp', () => {
 
     it('returns unknown error for unrecognized codes', async () => {
         const promise = checkTcp(baseMonitor);
-        process.nextTick(() => {
-            const err = new Error('Something weird');
-            err.code = 'EWHATEVER';
-            mockSocket.emit('error', err);
-        });
+        const err = new Error('Something weird');
+        err.code = 'EWHATEVER';
+        await emitWhenConnected('error', err);
         const result = await promise;
         expect(result.is_success).toBe(false);
         expect(result.error_type).toBe('unknown');
@@ -146,7 +154,7 @@ describe('checkTcp', () => {
 
     it('succeeds on connect regardless of how slow it was', async () => {
         const promise = checkTcp({ ...baseMonitor });
-        process.nextTick(() => mockSocket.emit('connect'));
+        await emitWhenConnected('connect');
         const result = await promise;
         expect(result.is_success).toBe(true);
         expect(result.error_type).toBeNull();
@@ -154,7 +162,7 @@ describe('checkTcp', () => {
 
     it('extracts host from plain hostname', async () => {
         const promise = checkTcp({ ...baseMonitor, url: 'myserver', port: 22 });
-        process.nextTick(() => mockSocket.emit('connect'));
+        await emitWhenConnected('connect');
         const result = await promise;
         expect(result.is_success).toBe(true);
     });

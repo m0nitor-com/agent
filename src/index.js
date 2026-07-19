@@ -179,9 +179,18 @@ async function pollAndCheck() {
                 batch.map(async (monitor) => {
                     try {
                         const result = await executeCheck(monitor);
-                        // Attach batch token if present
-                        if (result && monitor.batch_token) {
-                            result.batch_token = monitor.batch_token;
+                        if (result) {
+                            // Attach batch token if present
+                            if (monitor.batch_token) {
+                                result.batch_token = monitor.batch_token;
+                            }
+                            // Every result must carry the family it was checked for.
+                            // Checks stamp the actual family used; fall back to the
+                            // requested family for early/error results (watchdog, dns...).
+                            // A missing family is booked as ipv4 by the console.
+                            if (result.family == null && monitor.family) {
+                                result.family = monitor.family;
+                            }
                         }
                         return result;
                     } catch (error) {
@@ -192,6 +201,7 @@ async function pollAndCheck() {
                             error_type: 'worker_error',
                             error_message: `Worker error: ${error.message}`,
                             batch_token: monitor.batch_token,
+                            family: monitor.family || null,
                         };
                     }
                 })

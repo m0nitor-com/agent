@@ -1,4 +1,4 @@
-# Use Node.js 24 Alpine (Active LTS) for a small footprint
+# Use a current Node.js 24 Alpine base for a small footprint (satisfies engines >=22)
 FROM node:24-alpine
 
 # Set working directory

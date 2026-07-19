@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import EventEmitter from 'events';
+import dgram from 'dgram';
 
 vi.mock('../src/lib/logger.js', () => ({
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
@@ -7,7 +8,15 @@ vi.mock('../src/lib/logger.js', () => ({
 
 // SSRF guard OFF for this suite (existing fixtures use private IPs like 192.168.1.1).
 vi.mock('../src/lib/config.js', () => ({
-    config: { ALLOW_PRIVATE_TARGETS: true },
+    config: { ALLOW_PRIVATE_TARGETS: true, IP_FAMILY: 'auto' },
+}));
+
+// Pin resolution: return the host as-is with a family derived from its shape, so
+// the check picks udp4/udp6 and reports resolved_ip without touching real DNS.
+vi.mock('../src/lib/ssrf.js', () => ({
+    resolveAndCheck: vi.fn(async (host) => ({ ok: true, ip: host, family: String(host).includes(':') ? 6 : 4 })),
+    effectiveFamily: () => undefined,
+    familyLabel: (v) => (v === 6 ? 'ipv6' : 'ipv4'),
 }));
 
 let mockSocket;
@@ -39,12 +48,30 @@ describe('checkUdp', () => {
 
     it('returns success on timeout (no ICMP unreachable = port open)', async () => {
         const promise = checkUdp(baseMonitor);
-        vi.advanceTimersByTime(2000);
+        await vi.advanceTimersByTimeAsync(2000);
         const result = await promise;
 
         expect(result.is_success).toBe(true);
         expect(result.monitor_id).toBe(1);
         expect(result.response_time_ms).toBeTypeOf('number');
+        expect(dgram.createSocket).toHaveBeenCalledWith('udp4');
+        expect(result.resolved_ip).toBe('192.168.1.1');
+        expect(result.family).toBe('ipv4');
+    });
+
+    it('opens a udp6 socket and reports ipv6 for IPv6 targets', async () => {
+        mockSocket.send = vi.fn((msg, port, host, cb) => {
+            expect(host).toBe('::1');
+            cb(null);
+            process.nextTick(() => mockSocket.emit('message', Buffer.from('ok'), {}));
+        });
+
+        vi.useRealTimers();
+        const result = await checkUdp({ ...baseMonitor, url: '[::1]', port: 53 });
+        expect(dgram.createSocket).toHaveBeenCalledWith('udp6');
+        expect(result.family).toBe('ipv6');
+        expect(result.resolved_ip).toBe('::1');
+        expect(result.is_success).toBe(true);
     });
 
     it('returns success when message is received', async () => {

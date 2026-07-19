@@ -19,7 +19,7 @@ function sleep(ms) {
 }
 
 /**
- * API client for communicating with the Laravel backend
+ * API client for communicating with the m0nitor API
  */
 class ApiClient {
     constructor(baseUrl, token) {

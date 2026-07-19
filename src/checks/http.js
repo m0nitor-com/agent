@@ -6,7 +6,7 @@ import dns from 'node:dns';
 import ipaddr from 'ipaddr.js';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
-import { resolveAndCheck, isPrivateIp } from '../lib/ssrf.js';
+import { resolveAndCheck, isPrivateIp, stripBrackets, effectiveFamily, familyToNum, familyLabel } from '../lib/ssrf.js';
 import {
     MAX_RESPONSE_BODY_LENGTH,
     MAX_REQUEST_BODY_LENGTH,
@@ -176,25 +176,39 @@ export async function checkHttp(monitor) {
         response_headers: null,
         response_body_preview: null,
         ssl_info: null,
+        resolved_ip: null,
+        family: null,
     };
 
     // SSRF mitigation: block requests targeting private/reserved IPs unless the
     // monitor or the worker is explicitly opted into private targets.
     const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
+    const family = effectiveFamily(monitor.family, appConfig.IP_FAMILY);
+    const familyNum = familyToNum(family);
 
     // Guarded DNS lookup used by the http/https agents to prevent connecting to
     // private addresses (handles cases where DNS rebinding could trick us between
     // the pre-flight check and the actual socket connection).
     const guardedLookup = (hostname, options, cb) => {
-        dns.lookup(hostname, { all: true, verbatim: true }, (err, addrs) => {
+        dns.lookup(stripBrackets(hostname), { all: true, verbatim: true }, (err, addrs) => {
             if (err) return cb(err);
-            const list = Array.isArray(addrs) ? addrs : [addrs];
+            let list = Array.isArray(addrs) ? addrs : [addrs];
             for (const a of list) {
                 if (isPrivateIp(a.address)) {
                     const blockErr = new Error(`blocked_private_target:${a.address}`);
                     blockErr.code = 'EBLOCKED';
                     return cb(blockErr);
                 }
+            }
+            // Honour a forced address family (passed via the Agent's family option).
+            const wantFamily = options && options.family;
+            if (wantFamily === 4 || wantFamily === 6) {
+                list = list.filter((a) => a.family === wantFamily);
+            }
+            if (list.length === 0) {
+                const famErr = new Error('family_unavailable');
+                famErr.code = 'EFAMILY';
+                return cb(famErr);
             }
             if (options && options.all) return cb(null, list);
             return cb(null, list[0].address, list[0].family);
@@ -255,17 +269,19 @@ export async function checkHttp(monitor) {
         if (!allowPrivate) {
             // Build agents that BOTH enforce the guarded lookup (axios may
             // redirect across http <-> https, so we attach both).
-            requestConfig.httpAgent = new http.Agent({ lookup: guardedLookup });
+            requestConfig.httpAgent = new http.Agent({ family: familyNum, lookup: guardedLookup });
             requestConfig.httpsAgent = new https.Agent({
                 rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
+                family: familyNum,
                 lookup: guardedLookup,
             });
         } else if (isHttps) {
             requestConfig.httpsAgent = new https.Agent({
                 rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
+                family: familyNum,
             });
         } else {
-            requestConfig.httpAgent = new http.Agent();
+            requestConfig.httpAgent = new http.Agent({ family: familyNum });
         }
 
         if (!allowPrivate) {
@@ -279,7 +295,8 @@ export async function checkHttp(monitor) {
                 if (next.protocol !== 'http:' && next.protocol !== 'https:') {
                     throw new Error('blocked_redirect_scheme');
                 }
-                if (ipaddr.isValid(next.hostname) && isPrivateIp(next.hostname)) {
+                const nextHost = stripBrackets(next.hostname);
+                if (ipaddr.isValid(nextHost) && isPrivateIp(nextHost)) {
                     throw new Error('blocked_private_target');
                 }
             };
@@ -298,13 +315,23 @@ export async function checkHttp(monitor) {
                 result.error_message = 'Malformed monitor URL';
                 return result;
             }
-            const check = await resolveAndCheck(urlObj.hostname);
+            const check = await resolveAndCheck(urlObj.hostname, { family });
             if (!check.ok && check.reason === 'blocked_private_target') {
                 result.response_time_ms = Date.now() - startTime;
                 result.error_type = 'blocked_private_target';
                 result.error_message = `Target ${urlObj.hostname} resolves to a private/reserved IP (${check.ip})`;
                 logger.warn({ monitor_id: monitor.id, hostname: urlObj.hostname, ip: check.ip }, '[HTTP] Blocked private target');
                 return result;
+            }
+            if (!check.ok && check.reason === 'family_unavailable') {
+                result.response_time_ms = Date.now() - startTime;
+                result.error_type = 'family_unavailable';
+                result.error_message = `No ${family} address available for ${urlObj.hostname}`;
+                return result;
+            }
+            if (check.ok) {
+                result.resolved_ip = check.ip;
+                result.family = familyLabel(check.family);
             }
             // Note: dns_failure passes through; the actual request will surface ENOTFOUND/EAI_AGAIN normally
         }
@@ -314,6 +341,15 @@ export async function checkHttp(monitor) {
 
         result.response_time_ms = Date.now() - startTime;
         result.status_code = response.status;
+
+        // Capture the address actually connected to. Most accurate source of the
+        // family/IP used, and covers the allow-private path where no pre-flight ran.
+        const remoteIp = response.request?.socket?.remoteAddress
+            || response.request?.res?.socket?.remoteAddress || null;
+        if (remoteIp) {
+            result.resolved_ip = stripBrackets(remoteIp);
+            result.family = familyLabel(remoteIp) || result.family;
+        }
 
         // Filter response headers
         const filteredHeaders = filterHeaders(response.headers);
@@ -448,10 +484,10 @@ export async function checkHttp(monitor) {
                             logger.warn({ monitor_id: monitor.id, hostname: urlObj.hostname }, '[HTTP] Skipping TLS fallback for private host');
                             // Skip fetchCertificate; cert info remains absent.
                         } else {
-                            cert = await fetchCertificate(urlObj.hostname, parseInt(urlObj.port) || 443);
+                            cert = await fetchCertificate(stripBrackets(urlObj.hostname), parseInt(urlObj.port) || 443);
                         }
                     } else {
-                        cert = await fetchCertificate(urlObj.hostname, parseInt(urlObj.port) || 443);
+                        cert = await fetchCertificate(stripBrackets(urlObj.hostname), parseInt(urlObj.port) || 443);
                     }
                 }
 
@@ -504,7 +540,10 @@ export async function checkHttp(monitor) {
         const code = error.code || '';
         const message = error.message || '';
 
-        if (code === 'EBLOCKED' || message.includes('blocked_private_target') || message.includes('blocked_redirect')) {
+        if (code === 'EFAMILY' || message.includes('family_unavailable')) {
+            result.error_type = 'family_unavailable';
+            result.error_message = `No ${family} address available for the target`;
+        } else if (code === 'EBLOCKED' || message.includes('blocked_private_target') || message.includes('blocked_redirect')) {
             result.error_type = 'blocked_private_target';
             result.error_message = message.includes('blocked_redirect_scheme')
                 ? 'Redirect target uses a disallowed scheme'

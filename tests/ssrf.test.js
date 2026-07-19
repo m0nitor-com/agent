@@ -4,7 +4,7 @@ vi.mock('../src/lib/logger.js', () => ({
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
-const { isPrivateIp, isUrlSafeScheme, resolveAndCheck } = await import('../src/lib/ssrf.js');
+const { isPrivateIp, isUrlSafeScheme, resolveAndCheck, stripBrackets, familyToNum, familyLabel, effectiveFamily } = await import('../src/lib/ssrf.js');
 
 describe('isPrivateIp', () => {
     it('returns true for common IPv4 private/reserved ranges', () => {
@@ -112,5 +112,115 @@ describe('resolveAndCheck', () => {
         expect(result.ok).toBe(true);
         expect(result.ip).toBe('8.8.8.8');
         expect(result.family).toBe(4);
+    });
+
+    // Regression: URL.hostname keeps the brackets for IPv6 literals, which used to
+    // slip past the guard entirely (ipaddr.isValid('[::1]') === false).
+    it('blocks a bracketed IPv6 loopback literal', async () => {
+        const result = await resolveAndCheck('[::1]');
+        expect(result.ok).toBe(false);
+        expect(result.reason).toBe('blocked_private_target');
+    });
+
+    it('blocks a bracketed IPv4-mapped metadata literal', async () => {
+        const result = await resolveAndCheck('[::ffff:169.254.169.254]');
+        expect(result.ok).toBe(false);
+        expect(result.reason).toBe('blocked_private_target');
+    });
+
+    it('allows a bracketed public IPv6 literal', async () => {
+        const result = await resolveAndCheck('[2606:4700::1111]');
+        expect(result.ok).toBe(true);
+        expect(result.ip).toBe('2606:4700::1111');
+        expect(result.family).toBe(6);
+    });
+
+    it('selects the requested family (ipv6) from a dual-stack host', async () => {
+        const dnsLookup = async () => [
+            { address: '8.8.8.8', family: 4 },
+            { address: '2606:4700::1111', family: 6 },
+        ];
+        const result = await resolveAndCheck('public.example', { dnsLookup, family: 'ipv6' });
+        expect(result.ok).toBe(true);
+        expect(result.ip).toBe('2606:4700::1111');
+        expect(result.family).toBe(6);
+    });
+
+    it('selects the requested family (ipv4) from a dual-stack host', async () => {
+        const dnsLookup = async () => [
+            { address: '2606:4700::1111', family: 6 },
+            { address: '8.8.8.8', family: 4 },
+        ];
+        const result = await resolveAndCheck('public.example', { dnsLookup, family: 'ipv4' });
+        expect(result.ok).toBe(true);
+        expect(result.ip).toBe('8.8.8.8');
+        expect(result.family).toBe(4);
+    });
+
+    it('reports family_unavailable when the requested family is absent', async () => {
+        const dnsLookup = async () => [{ address: '8.8.8.8', family: 4 }];
+        const result = await resolveAndCheck('v4only.example', { dnsLookup, family: 'ipv6' });
+        expect(result.ok).toBe(false);
+        expect(result.reason).toBe('family_unavailable');
+    });
+
+    it('reports family_unavailable for a literal of the wrong family', async () => {
+        const result = await resolveAndCheck('8.8.8.8', { family: 'ipv6' });
+        expect(result.ok).toBe(false);
+        expect(result.reason).toBe('family_unavailable');
+    });
+
+    it('allowPrivate lets a private literal through (and pins it)', async () => {
+        const result = await resolveAndCheck('10.0.0.1', { allowPrivate: true });
+        expect(result.ok).toBe(true);
+        expect(result.ip).toBe('10.0.0.1');
+        expect(result.family).toBe(4);
+    });
+});
+
+describe('isPrivateIp - bracketed literals and documentation range', () => {
+    it('blocks bracketed private IPv6 literals', () => {
+        expect(isPrivateIp('[::1]')).toBe(true);
+        expect(isPrivateIp('[fe80::1]')).toBe(true);
+        expect(isPrivateIp('[::ffff:169.254.169.254]')).toBe(true);
+    });
+
+    it('blocks the 2001:db8::/32 documentation range', () => {
+        expect(isPrivateIp('2001:db8::1')).toBe(true);
+        expect(isPrivateIp('[2001:db8::dead]')).toBe(true);
+    });
+
+    it('still allows a bracketed public IPv6 literal', () => {
+        expect(isPrivateIp('[2606:4700::1111]')).toBe(false);
+    });
+});
+
+describe('family helpers', () => {
+    it('stripBrackets removes IPv6 literal brackets only', () => {
+        expect(stripBrackets('[::1]')).toBe('::1');
+        expect(stripBrackets('8.8.8.8')).toBe('8.8.8.8');
+        expect(stripBrackets('example.com')).toBe('example.com');
+    });
+
+    it('familyToNum maps labels/numbers to 4/6/0', () => {
+        expect(familyToNum('ipv6')).toBe(6);
+        expect(familyToNum('ipv4')).toBe(4);
+        expect(familyToNum('auto')).toBe(0);
+        expect(familyToNum(undefined)).toBe(0);
+    });
+
+    it('familyLabel maps numbers and IPs to labels', () => {
+        expect(familyLabel(6)).toBe('ipv6');
+        expect(familyLabel(4)).toBe('ipv4');
+        expect(familyLabel('2606:4700::1')).toBe('ipv6');
+        expect(familyLabel('8.8.8.8')).toBe('ipv4');
+        expect(familyLabel('not-an-ip')).toBe(null);
+    });
+
+    it('effectiveFamily prefers the monitor value, then the config default', () => {
+        expect(effectiveFamily('ipv6', 'auto')).toBe('ipv6');
+        expect(effectiveFamily(null, 'ipv4')).toBe('ipv4');
+        expect(effectiveFamily(null, 'auto')).toBe(undefined);
+        expect(effectiveFamily('ipv4', 'ipv6')).toBe('ipv4');
     });
 });

@@ -22,10 +22,16 @@ const withTimeout = (promise, timeout, message) => {
 };
 
 /**
- * Resolve a hostname with a timeout.
+ * Resolve a hostname to its IPs with a timeout. Uses a dual-stack lookup so a
+ * custom DNS server given as an IPv6-only hostname still resolves (previously
+ * only A records were queried).
  */
 const resolveWithTimeout = (hostname, timeout = DNS_RESOLUTION_TIMEOUT_MS) => {
-    return withTimeout(dns.resolve4(hostname), timeout, 'DNS resolution timeout');
+    return withTimeout(
+        dns.lookup(hostname, { all: true }).then((list) => list.map((a) => a.address)),
+        timeout,
+        'DNS resolution timeout',
+    );
 };
 
 /**

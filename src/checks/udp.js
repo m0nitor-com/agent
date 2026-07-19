@@ -1,7 +1,17 @@
 import dgram from 'dgram';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
-import { resolveAndCheck } from '../lib/ssrf.js';
+import { resolveAndCheck, effectiveFamily, familyLabel } from '../lib/ssrf.js';
+
+/**
+ * Parse "[ipv6]:port" or "[ipv6]" literals that new URL() cannot handle when the
+ * target has no scheme. Returns null when the input is not a bracketed literal.
+ */
+function parseBracketedLiteral(raw) {
+    const m = /^\[([0-9a-fA-F:]+)\](?::(\d+))?$/.exec(String(raw).trim());
+    if (!m) return null;
+    return { host: m[1], port: m[2] ? parseInt(m[2], 10) : null };
+}
 
 /**
  * Perform UDP port check on a monitor
@@ -14,6 +24,8 @@ export async function checkUdp(monitor) {
         response_time_ms: null,
         error_message: null,
         error_type: null,
+        resolved_ip: null,
+        family: null,
     };
 
     // Extract host and port up-front so we can run the SSRF pre-flight.
@@ -25,27 +37,48 @@ export async function checkUdp(monitor) {
             const url = new URL(monitor.url);
             host = url.hostname;
             port = monitor.port || parseInt(url.port) || 53;
+        } else {
+            const bracketed = parseBracketedLiteral(monitor.url);
+            if (bracketed) {
+                host = bracketed.host;
+                port = monitor.port || bracketed.port || 53;
+            }
         }
     } catch {
         // host is likely just an IP or hostname
     }
 
     const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
-    if (!allowPrivate) {
-        const check = await resolveAndCheck(host);
-        if (!check.ok && check.reason === 'blocked_private_target') {
-            result.response_time_ms = Date.now() - startTime;
+    const family = effectiveFamily(monitor.family, appConfig.IP_FAMILY);
+
+    // Resolve + SSRF pre-flight; pins the validated IP and its family so we open
+    // the matching udp4/udp6 socket instead of assuming IPv4.
+    const check = await resolveAndCheck(host, { family, allowPrivate });
+    if (!check.ok) {
+        result.response_time_ms = Date.now() - startTime;
+        if (check.reason === 'blocked_private_target') {
             result.error_type = 'blocked_private_target';
             result.error_message = `Target ${host} resolves to a private/reserved IP (${check.ip})`;
             logger.warn({ monitor_id: monitor.id, host, ip: check.ip }, '[UDP] Blocked private target');
-            return result;
+        } else if (check.reason === 'family_unavailable') {
+            result.error_type = 'family_unavailable';
+            result.error_message = `No ${family} address available for ${host}`;
+        } else {
+            const code = check.error?.code || '';
+            result.error_type = code === 'EAI_AGAIN' ? 'dns_temporary' : 'dns';
+            result.error_message = `DNS resolution failed for ${host}`;
         }
+        return result;
     }
+
+    const target = check.ip;
+    result.resolved_ip = target;
+    result.family = familyLabel(check.family);
 
     return new Promise((resolve) => {
         let resolved = false;
 
-        const client = dgram.createSocket('udp4');
+        const client = dgram.createSocket(check.family === 6 ? 'udp6' : 'udp4');
         const timeout = (monitor.timeout || 10) * 1000;
 
         const done = () => {
@@ -105,7 +138,7 @@ export async function checkUdp(monitor) {
 
         // Send a small dummy packet to trigger ICMP Unreachable if port is closed
         const message = Buffer.from('ping');
-        client.send(message, port, host, (error) => {
+        client.send(message, port, target, (error) => {
             if (error) {
                 result.response_time_ms = Date.now() - startTime;
                 result.is_success = false;

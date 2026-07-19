@@ -89,6 +89,11 @@ export function validateMonitor(raw) {
         criteria.keywords = [];
     }
 
+    // Normalize address family. The console sends a concrete family per check
+    // ('ipv4'|'ipv6'); anything else means "no per-monitor preference" (null), and
+    // the check falls back to the worker's IP_FAMILY default.
+    const family = (raw.family === 'ipv4' || raw.family === 'ipv6') ? raw.family : null;
+
     // Normalize header_assertions
     const validHeaderComparisons = ['contains', 'not_contains', 'eq', 'not_eq', 'empty', 'not_empty'];
     if (criteria.header_assertions != null) {
@@ -108,6 +113,7 @@ export function validateMonitor(raw) {
         ...raw,
         type,
         timeout,
+        family,
         success_criteria: criteria,
         // Preserve other fields (headers, body, method, etc.) as-is
     };

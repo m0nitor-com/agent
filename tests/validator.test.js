@@ -122,4 +122,12 @@ describe('validateMonitor', () => {
         expect(result).not.toBeNull();
         expect(result.allow_private_target).toBe(true);
     });
+
+    it('normalizes the address family and defaults to null', () => {
+        expect(validateMonitor({ ...validMonitor, family: 'ipv6' }).family).toBe('ipv6');
+        expect(validateMonitor({ ...validMonitor, family: 'ipv4' }).family).toBe('ipv4');
+        expect(validateMonitor({ ...validMonitor, family: 'both' }).family).toBe(null);
+        expect(validateMonitor({ ...validMonitor, family: 'garbage' }).family).toBe(null);
+        expect(validateMonitor(validMonitor).family).toBe(null);
+    });
 });
