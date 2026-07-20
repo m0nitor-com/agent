@@ -1,5 +1,5 @@
 # Use a current Node.js 24 Alpine base for a small footprint (satisfies engines >=22)
-FROM node:24-alpine
+FROM node:26-alpine
 
 # Set working directory
 WORKDIR /app
