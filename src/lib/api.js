@@ -1,5 +1,6 @@
 import axios from 'axios';
 import https from 'https';
+import http from 'http';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -14,25 +15,53 @@ const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.json'),
 /**
  * Sleep for a given number of milliseconds
  */
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(signal.reason || new Error('Request aborted'));
+            return;
+        }
+        const done = () => {
+            signal?.removeEventListener('abort', aborted);
+            resolve();
+        };
+        const aborted = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', aborted);
+            reject(signal.reason || new Error('Request aborted'));
+        };
+        const timer = setTimeout(done, ms);
+        timer.unref?.();
+        signal?.addEventListener('abort', aborted, { once: true });
+    });
 }
 
 /**
  * API client for communicating with the m0nitor API
  */
 class ApiClient {
-    constructor(baseUrl, token) {
+    constructor(baseUrl, token, capabilities = []) {
         this.baseUrl = baseUrl.replace(/\/$/, '');
         this.token = token;
         this.version = pkg.version;
         this.maxRetries = 3;
         this.baseDelay = 1000; // 1 second
 
-        // Only skip SSL verification if explicitly enabled (INSECURE)
-        const httpsAgent = config.SKIP_SSL_VERIFY
-            ? new https.Agent({ rejectUnauthorized: false })
-            : undefined;
+        this.httpAgent = new http.Agent({
+            keepAlive: true,
+            maxSockets: 2,
+            maxFreeSockets: 1,
+            timeout: 10_000,
+            scheduling: 'lifo',
+        });
+        this.httpsAgent = new https.Agent({
+            keepAlive: true,
+            maxSockets: 2,
+            maxFreeSockets: 1,
+            timeout: 10_000,
+            scheduling: 'lifo',
+            rejectUnauthorized: !config.SKIP_SSL_VERIFY,
+        });
 
         if (config.SKIP_SSL_VERIFY) {
             logger.warn('[API] SSL certificate verification is DISABLED. This is insecure!');
@@ -45,23 +74,33 @@ class ApiClient {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
                 'X-Worker-Version': this.version,
+                'X-Agent-Contract-Version': '2',
+                'X-Agent-Capabilities': capabilities.slice(0, 32).join(','),
                 'Authorization': `Bearer ${this.token}`,
             },
-            httpsAgent,
+            httpAgent: this.httpAgent,
+            httpsAgent: this.httpsAgent,
+            maxContentLength: 2 * 1024 * 1024,
+            maxBodyLength: 2 * 1024 * 1024,
         });
     }
 
     /**
      * Execute a request with exponential backoff retry
      */
-    async withRetry(fn, context = 'request') {
+    async withRetry(fn, context = 'request', options = {}) {
         let lastError;
+        const maxRetries = Number.isInteger(options.retries) ? options.retries : this.maxRetries;
 
-        for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
             try {
+                if (options.signal?.aborted) {
+                    throw options.signal.reason || new Error('Request aborted');
+                }
                 return await fn();
             } catch (error) {
                 lastError = error;
+                if (options.signal?.aborted) throw error;
 
                 // Don't retry on auth errors or validation errors
                 const status = error.response?.status;
@@ -69,47 +108,76 @@ class ApiClient {
                     throw error;
                 }
 
-                if (attempt < this.maxRetries) {
+                if (attempt < maxRetries) {
                     const delay = this.baseDelay * Math.pow(2, attempt);
                     const jitter = delay * (0.5 + Math.random() * 0.5);
-                    logger.warn(`[API] ${context} failed (attempt ${attempt + 1}/${this.maxRetries + 1}), retrying in ${Math.round(jitter)}ms...`);
-                    await sleep(jitter);
+                    logger.warn({
+                        context,
+                        attempt: attempt + 1,
+                        attempts: maxRetries + 1,
+                        retry_in_ms: Math.round(jitter),
+                        status: error.response?.status,
+                        code: error.code,
+                    }, '[API] Request failed, retrying');
+                    await sleep(jitter, options.signal);
                 }
             }
         }
 
-        logger.error({ err: lastError }, `[API] ${context} failed after ${this.maxRetries + 1} attempts`);
+        logger.error({
+            context,
+            attempts: maxRetries + 1,
+            status: lastError?.response?.status,
+            code: lastError?.code,
+        }, '[API] Request failed after retry limit');
         throw lastError;
     }
 
     /**
      * Fetch monitors that need to be checked
      */
-    async getChecks() {
+    async getChecks(options = {}) {
         return this.withRetry(async () => {
-            const response = await this.client.get('/workers/checks');
+            const health = options.health
+                ? Buffer.from(JSON.stringify(options.health)).toString('base64url')
+                : null;
+            const response = Object.keys(options).length > 0
+                ? await this.client.get('/workers/checks', {
+                    signal: options.signal,
+                    headers: health ? { 'X-Agent-Health': health.slice(0, 6000) } : undefined,
+                })
+                : await this.client.get('/workers/checks');
             return response.data;
-        }, 'getChecks');
+        }, 'getChecks', options);
     }
 
     /**
      * Report a check result to the backend
      */
-    async reportCheck(result) {
+    async reportCheck(result, options = {}) {
         return this.withRetry(async () => {
-            const response = await this.client.post('/workers/report', result);
+            const response = Object.keys(options).length > 0
+                ? await this.client.post('/workers/report', result, { signal: options.signal })
+                : await this.client.post('/workers/report', result);
             return response.data;
-        }, 'reportCheck');
+        }, 'reportCheck', options);
     }
 
     /**
      * Report a batch of check results to the backend in a single request.
      */
-    async reportBatch(results) {
+    async reportBatch(results, options = {}) {
         return this.withRetry(async () => {
-            const response = await this.client.post('/workers/report-batch', { reports: results });
+            const response = Object.keys(options).length > 0
+                ? await this.client.post('/workers/report-batch', { reports: results }, { signal: options.signal })
+                : await this.client.post('/workers/report-batch', { reports: results });
             return response.data;
-        }, 'reportBatch');
+        }, 'reportBatch', options);
+    }
+
+    close() {
+        this.httpAgent.destroy();
+        this.httpsAgent.destroy();
     }
 }
 

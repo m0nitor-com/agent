@@ -21,7 +21,7 @@ function parseBracketedLiteral(raw) {
 /**
  * Perform TCP port check on a monitor
  */
-export async function checkTcp(monitor) {
+export async function checkTcp(monitor, context = null) {
     const startTime = Date.now();
     const result = {
         monitor_id: monitor.id,
@@ -42,7 +42,7 @@ export async function checkTcp(monitor) {
         host = url.hostname;
         port = monitor.port || parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
     } catch {
-        // Not a URL — may be a bare host, or a bracketed IPv6 literal like [::1]:443.
+        // Not a URL - may be a bare host, or a bracketed IPv6 literal like [::1]:443.
         const bracketed = parseBracketedLiteral(monitor.url);
         if (bracketed) {
             host = bracketed.host;
@@ -55,7 +55,7 @@ export async function checkTcp(monitor) {
 
     // Resolve + SSRF pre-flight, and pin the validated IP so the socket cannot be
     // re-resolved to a different (private) address between check and connect.
-    const check = await resolveAndCheck(host, { family, allowPrivate });
+    const check = await resolveAndCheck(host, { family, allowPrivate, signal: context?.signal });
     if (!check.ok) {
         result.response_time_ms = Date.now() - startTime;
         if (check.reason === 'blocked_private_target') {
@@ -81,6 +81,7 @@ export async function checkTcp(monitor) {
         let resolved = false;
 
         const socket = new net.Socket();
+        const unregisterCleanup = context?.cleanup.add(() => socket.destroy());
         const timeoutS = Math.min(Math.max(MIN_MONITOR_TIMEOUT_S, monitor.timeout || DEFAULT_MONITOR_TIMEOUT_S), MAX_MONITOR_TIMEOUT_S);
         const timeout = timeoutS * 1000;
 
@@ -144,14 +145,23 @@ export async function checkTcp(monitor) {
             socket.off('connect', onConnect);
             socket.off('timeout', onTimeout);
             socket.off('error', onError);
+            context?.signal.removeEventListener('abort', onAbort);
+            unregisterCleanup?.();
             socket.destroy();
             resolve(result);
         };
+
+        const onAbort = () => done();
 
         socket.setTimeout(timeout);
         socket.on('connect', onConnect);
         socket.on('timeout', onTimeout);
         socket.on('error', onError);
+        context?.signal.addEventListener('abort', onAbort, { once: true });
+        if (context?.signal.aborted) {
+            onAbort();
+            return;
+        }
         // Connect to the validated IP literal (family is implied by the address).
         socket.connect({ host: target, port, family: check.family });
     });

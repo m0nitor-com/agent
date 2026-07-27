@@ -1,7 +1,7 @@
 /**
  * Compute the next poll delay with exponential backoff + full jitter.
  *
- * Steady-state (no failures): returns baseInterval exactly — no jitter on the
+ * Steady-state (no failures): returns baseInterval exactly - no jitter on the
  * happy path, since steady-state cadence should stay deterministic.
  *
  * Under failure: target = min(baseInterval * 2^failures, maxInterval), then
@@ -9,10 +9,10 @@
  * is critical to prevent thundering-herd recovery when many probes failed at
  * roughly the same time and the console comes back up.
  *
- * @param {number} baseInterval — steady-state interval (ms)
- * @param {number} maxInterval — cap (ms); should be >= baseInterval
- * @param {number} consecutiveFailures — failure count since last success
- * @param {() => number} [rng] — injectable RNG for tests; defaults to Math.random
+ * @param {number} baseInterval - steady-state interval (ms)
+ * @param {number} maxInterval - cap (ms); should be >= baseInterval
+ * @param {number} consecutiveFailures - failure count since last success
+ * @param {() => number} [rng] - injectable RNG for tests; defaults to Math.random
  * @returns {number} delay in ms
  */
 export function computeNextPollDelay(baseInterval, maxInterval, consecutiveFailures, rng = Math.random) {

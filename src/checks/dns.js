@@ -1,11 +1,10 @@
 import dns from 'dns/promises';
-import net from 'net';
 import { config as appConfig } from '../lib/config.js';
 import { logger } from '../lib/logger.js';
 import { resolveAndCheck } from '../lib/ssrf.js';
 import {
-    DNS_RESOLUTION_TIMEOUT_MS,
     MAX_DNS_RECORDS,
+    MAX_ERROR_MESSAGE_LENGTH,
     DEFAULT_MONITOR_TIMEOUT_S,
 } from '../lib/constants.js';
 
@@ -13,42 +12,25 @@ import {
  * Race a promise against a timeout. The timer is always cleared so it never
  * leaks or keeps the event loop alive after the promise settles.
  */
-const withTimeout = (promise, timeout, message) => {
+const withTimeout = (promise, timeout, message, context = null) => {
     let timer;
+    let onAbort;
     const timeoutPromise = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error(message)), timeout);
+        timer.unref?.();
+        onAbort = () => reject(context.signal.reason || new Error('DNS operation aborted'));
+        context?.signal.addEventListener('abort', onAbort, { once: true });
     });
-    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+        clearTimeout(timer);
+        context?.signal.removeEventListener('abort', onAbort);
+    });
 };
-
-/**
- * Resolve a hostname to its IPs with a timeout. Uses a dual-stack lookup so a
- * custom DNS server given as an IPv6-only hostname still resolves (previously
- * only A records were queried).
- */
-const resolveWithTimeout = (hostname, timeout = DNS_RESOLUTION_TIMEOUT_MS) => {
-    return withTimeout(
-        dns.lookup(hostname, { all: true }).then((list) => list.map((a) => a.address)),
-        timeout,
-        'DNS resolution timeout',
-    );
-};
-
-/**
- * Singleton DNS resolver cache.
- * Reuses resolver instances keyed by their server configuration.
- */
-const resolverCache = new Map();
 
 function getResolver(servers) {
-    const key = servers ? servers.sort().join(',') : '__system__';
-    let resolver = resolverCache.get(key);
-    if (!resolver) {
-        resolver = new dns.Resolver();
-        if (servers) {
-            resolver.setServers(servers);
-        }
-        resolverCache.set(key, resolver);
+    const resolver = new dns.Resolver();
+    if (servers) {
+        resolver.setServers(servers);
     }
     return resolver;
 }
@@ -56,7 +38,7 @@ function getResolver(servers) {
 /**
  * Execute a DNS check
  */
-async function checkDns(monitor) {
+async function checkDns(monitor, context = null) {
     const start = Date.now();
     const hostname = monitor.url.replace(/^https?:\/\//, '').split('/')[0];
     const recordType = (monitor.method || 'A').toUpperCase();
@@ -68,12 +50,15 @@ async function checkDns(monitor) {
         let results = [];
         let resolverServers = null;
 
-        // SSRF mitigation: guard the DNS server we are about to query against —
+        // SSRF mitigation: guard the DNS server we are about to query against -
         // NOT the queried hostname (legitimate DNS monitors may target public
         // domains that happen to resolve to internal IPs).
         const allowPrivate = monitor.allow_private_target === true || appConfig.ALLOW_PRIVATE_TARGETS === true;
-        if (customServer && !allowPrivate) {
-            const check = await resolveAndCheck(customServer);
+        if (customServer) {
+            const check = await resolveAndCheck(customServer, {
+                allowPrivate,
+                signal: context?.signal,
+            });
             if (!check.ok && check.reason === 'blocked_private_target') {
                 logger.warn({ monitor_id: monitor.id, dns_server: customServer, ip: check.ip }, '[DNS] Blocked private target');
                 return {
@@ -84,22 +69,14 @@ async function checkDns(monitor) {
                     error_message: `DNS server ${customServer} resolves to a private/reserved IP (${check.ip})`,
                 };
             }
-        }
-
-        if (customServer) {
-            if (net.isIP(customServer)) {
-                resolverServers = [customServer];
-            } else {
-                const ips = await resolveWithTimeout(customServer);
-                if (ips.length > 0) {
-                    resolverServers = ips;
-                } else {
-                    throw new Error(`Could not resolve custom DNS server hostname: ${customServer}`);
-                }
+            if (!check.ok) {
+                throw new Error(`Could not resolve custom DNS server hostname: ${customServer}`);
             }
+            resolverServers = [check.ip];
         }
 
         const resolver = getResolver(resolverServers);
+        const unregisterCleanup = context?.cleanup.add(() => resolver.cancel?.());
 
         // The underlying c-ares queries are not bound by the monitor's timeout,
         // so race them against it to honor the configured hard limit.
@@ -136,7 +113,9 @@ async function checkDns(monitor) {
             }
         };
 
-        results = await withTimeout(runQuery(), queryTimeoutMs, 'DNS query timeout');
+        results = await withTimeout(runQuery(), queryTimeoutMs, 'DNS query timeout', context);
+        unregisterCleanup?.();
+        resolver.cancel?.();
 
         const responseTime = Date.now() - start;
 
@@ -158,7 +137,7 @@ async function checkDns(monitor) {
                     is_success: false,
                     response_time_ms: responseTime,
                     error_type: 'dns_mismatch',
-                    error_message: `Expected value "${expectedValue}" not found in results: ${results.join(', ')}`,
+                    error_message: `Expected value "${expectedValue}" not found in results: ${results.join(', ')}`.slice(0, MAX_ERROR_MESSAGE_LENGTH),
                     dns_info: dnsInfo,
                 };
             }
@@ -176,7 +155,8 @@ async function checkDns(monitor) {
         const code = error.code || '';
 
         let errorType = 'dns_error';
-        let errorMessage = `DNS Error: ${error.message}`;
+        const rawMessage = typeof error.message === 'string' ? error.message.slice(0, MAX_ERROR_MESSAGE_LENGTH) : '';
+        let errorMessage = `DNS Error: ${rawMessage}`.slice(0, MAX_ERROR_MESSAGE_LENGTH);
 
         if (code === 'ENOTFOUND' || code === 'ENODATA') {
             errorType = 'dns';
@@ -184,7 +164,7 @@ async function checkDns(monitor) {
         } else if (code === 'ESERVFAIL') {
             errorType = 'dns_servfail';
             errorMessage = `DNS server failed to resolve ${hostname} (SERVFAIL)`;
-        } else if (code === 'ETIMEOUT' || code === 'TIMEOUT' || (error.message || '').toLowerCase().includes('timeout')) {
+        } else if (code === 'ETIMEOUT' || code === 'TIMEOUT' || rawMessage.toLowerCase().includes('timeout')) {
             errorType = 'timeout';
             errorMessage = `DNS resolution timed out for ${hostname}`;
         } else if (code === 'EREFUSED' || code === 'ECONNREFUSED') {
@@ -203,7 +183,7 @@ async function checkDns(monitor) {
             is_success: false,
             response_time_ms: responseTime,
             error_type: errorType,
-            error_message: errorMessage,
+            error_message: errorMessage.slice(0, MAX_ERROR_MESSAGE_LENGTH),
         };
     }
 }

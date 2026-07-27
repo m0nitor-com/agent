@@ -27,7 +27,7 @@ export function validateMonitor(raw) {
     const type = String(raw.type || '').toLowerCase();
     if (!validTypes.includes(type)) {
         logger.warn({ monitor_id: raw.id, type: raw.type }, '[VALIDATOR] Unknown monitor type');
-        // Still return it — executeCheck handles unknown types gracefully
+        // Still return it - executeCheck handles unknown types gracefully
     }
 
     // url is required for all types

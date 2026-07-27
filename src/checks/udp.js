@@ -16,7 +16,7 @@ function parseBracketedLiteral(raw) {
 /**
  * Perform UDP port check on a monitor
  */
-export async function checkUdp(monitor) {
+export async function checkUdp(monitor, context = null) {
     const startTime = Date.now();
     const result = {
         monitor_id: monitor.id,
@@ -53,7 +53,7 @@ export async function checkUdp(monitor) {
 
     // Resolve + SSRF pre-flight; pins the validated IP and its family so we open
     // the matching udp4/udp6 socket instead of assuming IPv4.
-    const check = await resolveAndCheck(host, { family, allowPrivate });
+    const check = await resolveAndCheck(host, { family, allowPrivate, signal: context?.signal });
     if (!check.ok) {
         result.response_time_ms = Date.now() - startTime;
         if (check.reason === 'blocked_private_target') {
@@ -79,15 +79,22 @@ export async function checkUdp(monitor) {
         let resolved = false;
 
         const client = dgram.createSocket(check.family === 6 ? 'udp6' : 'udp4');
+        const unregisterCleanup = context?.cleanup.add(() => {
+            try { client.close(); } catch { /* already closed */ }
+        });
         const timeout = (monitor.timeout || 10) * 1000;
 
         const done = () => {
             if (resolved) return;
             resolved = true;
             clearTimeout(timer);
+            context?.signal.removeEventListener('abort', onAbort);
+            unregisterCleanup?.();
             try { client.close(); } catch { /* already closed */ }
             resolve(result);
         };
+
+        const onAbort = () => done();
 
         const timer = setTimeout(() => {
             // For UDP, no ICMP unreachable within the timeout = port is likely open.
@@ -138,6 +145,11 @@ export async function checkUdp(monitor) {
 
         // Send a small dummy packet to trigger ICMP Unreachable if port is closed
         const message = Buffer.from('ping');
+        context?.signal.addEventListener('abort', onAbort, { once: true });
+        if (context?.signal.aborted) {
+            onAbort();
+            return;
+        }
         client.send(message, port, target, (error) => {
             if (error) {
                 result.response_time_ms = Date.now() - startTime;

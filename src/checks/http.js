@@ -1,11 +1,10 @@
 import axios from 'axios';
-import https from 'https';
 import http from 'http';
 import tls from 'tls';
-import dns from 'node:dns';
 import ipaddr from 'ipaddr.js';
 import { logger } from '../lib/logger.js';
 import { config as appConfig } from '../lib/config.js';
+import { sharedHttpCheckAgent } from '../lib/http-agent-pool.js';
 import { resolveAndCheck, isPrivateIp, stripBrackets, effectiveFamily, familyToNum, familyLabel } from '../lib/ssrf.js';
 import {
     MAX_RESPONSE_BODY_LENGTH,
@@ -146,25 +145,42 @@ function normalizeRequestHeaders(rawHeaders) {
  * Fetch SSL certificate for a given hostname, used as fallback when the
  * original connection cert is unavailable (e.g. after cross-host redirects).
  */
-function fetchCertificate(hostname, port = 443) {
+function fetchCertificate(hostname, target, port = 443, context = null) {
     return new Promise((resolve, reject) => {
+        let settled = false;
         const tlsSocket = tls.connect(
-            { host: hostname, port, servername: hostname, timeout: TLS_HANDSHAKE_TIMEOUT_MS },
+            {
+                host: target,
+                port,
+                servername: hostname,
+                timeout: Math.min(TLS_HANDSHAKE_TIMEOUT_MS, context?.remainingMs() || TLS_HANDSHAKE_TIMEOUT_MS),
+            },
             () => {
                 const peerCert = tlsSocket.getPeerCertificate();
-                tlsSocket.destroy();
-                resolve(peerCert);
+                finish(resolve, peerCert);
             }
         );
-        tlsSocket.on('error', (err) => { tlsSocket.destroy(); reject(err); });
-        tlsSocket.setTimeout(TLS_HANDSHAKE_TIMEOUT_MS, () => { tlsSocket.destroy(); reject(new Error('TLS handshake timeout')); });
+        const unregisterCleanup = context?.cleanup.add(() => tlsSocket.destroy());
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            context?.signal.removeEventListener('abort', onAbort);
+            unregisterCleanup?.();
+            tlsSocket.destroy();
+            callback(value);
+        };
+        const onAbort = () => finish(reject, context.signal.reason || new Error('TLS check aborted'));
+        tlsSocket.on('error', (err) => finish(reject, err));
+        tlsSocket.setTimeout(TLS_HANDSHAKE_TIMEOUT_MS, () => finish(reject, new Error('TLS handshake timeout')));
+        context?.signal.addEventListener('abort', onAbort, { once: true });
+        if (context?.signal.aborted) onAbort();
     });
 }
 
 /**
  * Perform HTTP/HTTPS check on a monitor
  */
-export async function checkHttp(monitor) {
+export async function checkHttp(monitor, context = null) {
     const startTime = Date.now();
     const result = {
         monitor_id: monitor.id,
@@ -190,29 +206,25 @@ export async function checkHttp(monitor) {
     // private addresses (handles cases where DNS rebinding could trick us between
     // the pre-flight check and the actual socket connection).
     const guardedLookup = (hostname, options, cb) => {
-        dns.lookup(stripBrackets(hostname), { all: true, verbatim: true }, (err, addrs) => {
-            if (err) return cb(err);
-            let list = Array.isArray(addrs) ? addrs : [addrs];
-            for (const a of list) {
-                if (isPrivateIp(a.address)) {
-                    const blockErr = new Error(`blocked_private_target:${a.address}`);
-                    blockErr.code = 'EBLOCKED';
-                    return cb(blockErr);
-                }
+        resolveAndCheck(stripBrackets(hostname), {
+            family: options?.family || family,
+            allowPrivate,
+            signal: context?.signal,
+        }).then((resolved) => {
+            if (!resolved.ok) {
+                const error = new Error(resolved.reason);
+                error.code = resolved.reason === 'blocked_private_target'
+                    ? 'EBLOCKED'
+                    : resolved.reason === 'family_unavailable' ? 'EFAMILY' : 'ENOTFOUND';
+                cb(error);
+                return;
             }
-            // Honour a forced address family (passed via the Agent's family option).
-            const wantFamily = options && options.family;
-            if (wantFamily === 4 || wantFamily === 6) {
-                list = list.filter((a) => a.family === wantFamily);
+            if (options?.all) {
+                cb(null, [{ address: resolved.ip, family: resolved.family }]);
+                return;
             }
-            if (list.length === 0) {
-                const famErr = new Error('family_unavailable');
-                famErr.code = 'EFAMILY';
-                return cb(famErr);
-            }
-            if (options && options.all) return cb(null, list);
-            return cb(null, list[0].address, list[0].family);
-        });
+            cb(null, resolved.ip, resolved.family);
+        }, cb);
     };
 
     try {
@@ -239,7 +251,6 @@ export async function checkHttp(monitor) {
             }
         }
 
-        const isHttps = monitor.url?.startsWith('https://');
         const timeoutSeconds = Math.min(
             Math.max(MIN_MONITOR_TIMEOUT_S, Number.isFinite(Number(monitor.timeout)) ? Number(monitor.timeout) : DEFAULT_MONITOR_TIMEOUT_S),
             MAX_MONITOR_TIMEOUT_S
@@ -263,29 +274,23 @@ export async function checkHttp(monitor) {
             maxContentLength: MAX_RESPONSE_BODY_LENGTH,
             maxBodyLength: MAX_REQUEST_BODY_LENGTH,
             validateStatus: () => true,
+            signal: context?.signal,
+            family: familyNum,
+            lookup: guardedLookup,
         };
 
         const sslCheck = monitor.success_criteria?.ssl_check !== false;
-        if (!allowPrivate) {
-            // Build agents that BOTH enforce the guarded lookup (axios may
-            // redirect across http <-> https, so we attach both).
-            requestConfig.httpAgent = new http.Agent({ family: familyNum, lookup: guardedLookup });
-            requestConfig.httpsAgent = new https.Agent({
-                rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
-                family: familyNum,
-                lookup: guardedLookup,
-            });
-        } else if (isHttps) {
-            requestConfig.httpsAgent = new https.Agent({
-                rejectUnauthorized: sslCheck && !appConfig.SKIP_SSL_VERIFY,
-                family: familyNum,
-            });
-        } else {
-            requestConfig.httpAgent = new http.Agent({ family: familyNum });
-        }
+        const verifyTls = sslCheck && !appConfig.SKIP_SSL_VERIFY;
+        // Pools are split by trust and TLS policy. The guarded per-request
+        // lookup pins every newly opened socket, while keep-alive can safely
+        // reuse an already validated socket for the same origin.
+        requestConfig.httpAgent = sharedHttpCheckAgent('http', allowPrivate, true);
+        requestConfig.httpsAgent = sharedHttpCheckAgent('https', allowPrivate, verifyTls);
 
-        if (!allowPrivate) {
-            requestConfig.beforeRedirect = (options) => {
+        requestConfig.beforeRedirect = (options) => {
+            options.lookup = guardedLookup;
+            options.family = familyNum;
+            if (!allowPrivate) {
                 const href = options.href || (options.protocol && options.hostname
                     ? `${options.protocol}//${options.hostname}${options.path || ''}`
                     : null);
@@ -299,8 +304,8 @@ export async function checkHttp(monitor) {
                 if (ipaddr.isValid(nextHost) && isPrivateIp(nextHost)) {
                     throw new Error('blocked_private_target');
                 }
-            };
-        }
+            }
+        };
 
         if (monitor.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
             requestConfig.data = monitor.body;
@@ -315,7 +320,7 @@ export async function checkHttp(monitor) {
                 result.error_message = 'Malformed monitor URL';
                 return result;
             }
-            const check = await resolveAndCheck(urlObj.hostname, { family });
+            const check = await resolveAndCheck(urlObj.hostname, { family, signal: context?.signal });
             if (!check.ok && check.reason === 'blocked_private_target') {
                 result.response_time_ms = Date.now() - startTime;
                 result.error_type = 'blocked_private_target';
@@ -466,7 +471,7 @@ export async function checkHttp(monitor) {
                     try {
                         const finalHostname = new URL(finalUrl).hostname;
                         if (finalHostname !== certHostname) {
-                            // Redirected to different host — must fetch cert for the final host
+                            // Redirected to different host - must fetch cert for the final host
                             logger.debug({ monitor_id: monitor.id, from: certHostname, to: finalHostname },
                                 '[HTTP] Redirect changed host, fetching SSL cert for final host');
                             certHostname = finalHostname;
@@ -478,16 +483,20 @@ export async function checkHttp(monitor) {
                 // Fallback: raw TLS connect (only if socket cert unavailable)
                 if (!cert || !cert.valid_to) {
                     const urlObj = new URL(finalUrl || monitor.url);
-                    if (!allowPrivate) {
-                        const tlsCheck = await resolveAndCheck(urlObj.hostname);
-                        if (!tlsCheck.ok && tlsCheck.reason === 'blocked_private_target') {
-                            logger.warn({ monitor_id: monitor.id, hostname: urlObj.hostname }, '[HTTP] Skipping TLS fallback for private host');
-                            // Skip fetchCertificate; cert info remains absent.
-                        } else {
-                            cert = await fetchCertificate(stripBrackets(urlObj.hostname), parseInt(urlObj.port) || 443);
-                        }
-                    } else {
-                        cert = await fetchCertificate(stripBrackets(urlObj.hostname), parseInt(urlObj.port) || 443);
+                    const tlsCheck = await resolveAndCheck(urlObj.hostname, {
+                        family,
+                        allowPrivate,
+                        signal: context?.signal,
+                    });
+                    if (!tlsCheck.ok && tlsCheck.reason === 'blocked_private_target') {
+                        logger.warn({ monitor_id: monitor.id, hostname: urlObj.hostname }, '[HTTP] Skipping TLS fallback for private host');
+                    } else if (tlsCheck.ok) {
+                        cert = await fetchCertificate(
+                            stripBrackets(urlObj.hostname),
+                            tlsCheck.ip,
+                            parseInt(urlObj.port) || 443,
+                            context,
+                        );
                     }
                 }
 
@@ -584,6 +593,12 @@ export async function checkHttp(monitor) {
         } else if (code === 'ERR_FR_TOO_MANY_REDIRECTS' || message.includes('maxRedirects')) {
             result.error_type = 'too_many_redirects';
             result.error_message = `Too many redirects (max ${MAX_REDIRECTS})`;
+        } else if (code === 'HPE_HEADER_OVERFLOW' || error.cause?.code === 'HPE_HEADER_OVERFLOW') {
+            result.error_type = 'header_overflow';
+            result.error_message = `Response headers exceed the ${Math.round(http.maxHeaderSize / 1024)} KB this agent can parse`;
+        } else if (code?.startsWith('HPE_') || message.startsWith('Parse Error')) {
+            result.error_type = 'malformed_response';
+            result.error_message = `The server sent a response this client could not parse: ${message}`;
         } else {
             result.error_type = 'unknown';
             result.error_message = message || 'Unknown error';

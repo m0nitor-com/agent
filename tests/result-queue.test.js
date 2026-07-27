@@ -59,25 +59,46 @@ describe('ResultQueue', () => {
     });
 
     it('limits queue size and drops oldest', () => {
-        // Fill queue manually beyond max
-        for (let i = 0; i < 1001; i++) {
+        // Fill queue manually beyond max (SKU default is 500)
+        for (let i = 0; i < 501; i++) {
             queue.enqueue({ monitor_id: i, is_success: true });
         }
-        expect(queue.size).toBe(1000);
+        expect(queue.size).toBe(500);
+    });
+
+    it('dropOldest removes the oldest buffered results', () => {
+        queue.enqueue({ monitor_id: 1, is_success: true });
+        queue.enqueue({ monitor_id: 2, is_success: true });
+        expect(queue.dropOldest(1)).toBe(1);
+        expect(queue.size).toBe(1);
+        expect(queue.queue[0].result.monitor_id).toBe(2);
+    });
+
+    it('limits serialized retry bytes and records the drop policy', () => {
+        queue = new ResultQueue(mockApi, { maxEntries: 10, maxBytes: 180 });
+        queue.enqueue({ monitor_id: 1, is_success: false, error_message: 'x'.repeat(50) });
+        queue.enqueue({ monitor_id: 2, is_success: false, error_message: 'y'.repeat(50) });
+
+        expect(queue.size).toBeLessThanOrEqual(1);
+        expect(queue.bytes).toBeLessThanOrEqual(180);
+        expect(queue.telemetry.counters.dropped_oldest).toBeGreaterThanOrEqual(1);
     });
 
     it('processes queue and removes successful items', async () => {
-        // Enqueue manually
-        queue.queue.push({ result: fakeResult, retries: 0 });
-        mockApi.reportCheck.mockResolvedValue({});
+        queue.enqueue(fakeResult);
+        mockApi.reportBatch.mockResolvedValue({});
 
         await queue.processQueue();
         expect(queue.size).toBe(0);
+        expect(mockApi.reportBatch).toHaveBeenCalledWith(
+            [fakeResult],
+            expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
     });
 
     it('keeps failed items in queue with incremented retries', async () => {
-        queue.queue.push({ result: fakeResult, retries: 0 });
-        mockApi.reportCheck.mockRejectedValue(new Error('Still failing'));
+        queue.enqueue(fakeResult);
+        mockApi.reportBatch.mockRejectedValue(new Error('Still failing'));
 
         await queue.processQueue();
         expect(queue.size).toBe(1);
@@ -85,8 +106,9 @@ describe('ResultQueue', () => {
     });
 
     it('discards items after max retries', async () => {
-        queue.queue.push({ result: fakeResult, retries: 4 }); // one more retry = 5 = max
-        mockApi.reportCheck.mockRejectedValue(new Error('Still failing'));
+        queue.enqueue(fakeResult);
+        queue.queue[0].retries = 4; // one more retry = 5 = max
+        mockApi.reportBatch.mockRejectedValue(new Error('Still failing'));
 
         await queue.processQueue();
         expect(queue.size).toBe(0);
@@ -97,5 +119,35 @@ describe('ResultQueue', () => {
         expect(queue.retryTimer).not.toBeNull();
         queue.stop();
         expect(queue.retryTimer).toBeNull();
+    });
+
+    it('aborts in-flight retry processing when flush deadline is exceeded', async () => {
+        let reportSignal = null;
+        mockApi.reportBatch.mockImplementation((_chunk, options = {}) => new Promise((_, reject) => {
+            reportSignal = options.signal;
+            const fail = () => reject(options.signal?.reason || new Error('aborted'));
+            if (options.signal?.aborted) {
+                fail();
+                return;
+            }
+            options.signal?.addEventListener('abort', fail, { once: true });
+        }));
+
+        queue.enqueue(fakeResult);
+        const processing = queue.processQueue();
+        await vi.waitFor(() => {
+            expect(mockApi.reportBatch).toHaveBeenCalled();
+            expect(reportSignal).not.toBeNull();
+        });
+
+        const started = Date.now();
+        const flushed = await queue.flush(40);
+        const elapsed = Date.now() - started;
+
+        expect(flushed).toBe(false);
+        expect(elapsed).toBeLessThan(250);
+        expect(reportSignal.aborted).toBe(true);
+        await processing;
+        expect(queue.size).toBe(1);
     });
 });

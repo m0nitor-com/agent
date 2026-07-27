@@ -1,0 +1,66 @@
+{
+  "environment": {
+    "node": "v22.13.1",
+    "platform": "win32",
+    "arch": "x64",
+    "cpu": "AMD Ryzen 7 5800X",
+    "note": "Node executes the benchmark on one event loop. Three-run medians."
+  },
+  "unchanged_runtime_baseline": {
+    "profile": "stress",
+    "mode": "legacy-fixed-chunks",
+    "checks": 12000,
+    "elapsed_ms": 12441.2,
+    "throughput_per_second": 964.54,
+    "peak_rss_bytes": 39088128,
+    "peak_heap_bytes": 4797720,
+    "event_loop_delay_mean_ms": 15.59,
+    "event_loop_delay_p99_ms": 16.409,
+    "peak_active_handles": 0,
+    "report_batch_count": 400
+  },
+  "final_representative_profile": {
+    "profile": "typical",
+    "mix": {
+      "network_percent": 90,
+      "database_percent": 9,
+      "diagnostic_percent": 1
+    },
+    "legacy": {
+      "elapsed_ms": 12383.39,
+      "throughput_per_second": 969.04,
+      "peak_rss_bytes": 43036672,
+      "peak_heap_bytes": 5151624,
+      "event_loop_delay_mean_ms": 15.546,
+      "event_loop_delay_p99_ms": 16.376,
+      "peak_active_handles": 0,
+      "report_batch_count": 400
+    },
+    "runtime": {
+      "elapsed_ms": 10142.73,
+      "throughput_per_second": 1183.11,
+      "peak_rss_bytes": 53579776,
+      "peak_heap_bytes": 12367112,
+      "event_loop_delay_mean_ms": 15.534,
+      "event_loop_delay_p99_ms": 16.228,
+      "peak_active_handles": 0,
+      "report_batch_count": 120
+    },
+    "throughput_improvement_percent_vs_unchanged_baseline": 22.66,
+    "peak_rss_percent_of_1_gib": 4.99
+  },
+  "final_diagnostic_stress_profile": {
+    "profile": "stress",
+    "mode": "runtime-fair-budgets",
+    "checks": 12000,
+    "elapsed_ms": 28565.07,
+    "throughput_per_second": 420.09,
+    "peak_rss_bytes": 50270208,
+    "peak_heap_bytes": 8088568,
+    "event_loop_delay_mean_ms": 15.56,
+    "event_loop_delay_p99_ms": 16.409,
+    "peak_active_handles": 0,
+    "report_batch_count": 120,
+    "note": "One diagnostic slot deliberately bounds expensive process work."
+  }
+}

@@ -244,6 +244,35 @@ describe('checkHttp', () => {
         expect(result.error_type).toBe('ssl_self_signed');
     });
 
+    it('names an oversized header block instead of calling it unknown', async () => {
+        const err = new Error('Parse Error: Header overflow');
+        err.code = 'HPE_HEADER_OVERFLOW';
+        mockAxios.mockRejectedValue(err);
+
+        const result = await checkHttp(baseMonitor);
+        expect(result.is_success).toBe(false);
+        expect(result.error_type).toBe('header_overflow');
+        expect(result.error_message).toMatch(/\d+ KB this agent can parse/);
+    });
+
+    it('reads the overflow through an axios wrapper that only carries a cause', async () => {
+        const err = new Error('Parse Error: Header overflow');
+        err.cause = { code: 'HPE_HEADER_OVERFLOW' };
+        mockAxios.mockRejectedValue(err);
+
+        const result = await checkHttp(baseMonitor);
+        expect(result.error_type).toBe('header_overflow');
+    });
+
+    it('separates other parser aborts from an unknown failure', async () => {
+        const err = new Error('Parse Error: Invalid header value char');
+        err.code = 'HPE_INVALID_HEADER_TOKEN';
+        mockAxios.mockRejectedValue(err);
+
+        const result = await checkHttp(baseMonitor);
+        expect(result.error_type).toBe('malformed_response');
+    });
+
     it('handles too many redirects', async () => {
         const err = new Error('maxRedirects exceeded');
         err.code = 'ERR_FR_TOO_MANY_REDIRECTS';

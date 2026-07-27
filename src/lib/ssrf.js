@@ -39,6 +39,43 @@ const BLOCKED_IPV6_RANGES = new Set([
 // is matched explicitly. It is reserved and must never be a real monitor target.
 const DOCUMENTATION_IPV6 = ipaddr.parseCIDR('2001:db8::/32');
 
+async function resolveWithCancellableResolver(host, family, signal) {
+    const resolver = new dns.Resolver();
+    const cancel = () => resolver.cancel();
+    if (signal?.aborted) {
+        return { error: signal.reason || new Error('DNS resolution aborted') };
+    }
+    signal?.addEventListener('abort', cancel, { once: true });
+
+    const normalize = (addresses, addressFamily) => addresses.map((address) => ({
+        address,
+        family: addressFamily,
+    }));
+    const swallowNoData = (error) => {
+        if (['ENODATA', 'ENOTFOUND', 'ENODOMAIN'].includes(error?.code)) return [];
+        throw error;
+    };
+
+    try {
+        if (family === 4) {
+            return { addresses: normalize(await resolver.resolve4(host), 4) };
+        }
+        if (family === 6) {
+            return { addresses: normalize(await resolver.resolve6(host), 6) };
+        }
+
+        const [ipv4, ipv6] = await Promise.all([
+            resolver.resolve4(host).catch(swallowNoData),
+            resolver.resolve6(host).catch(swallowNoData),
+        ]);
+        return { addresses: [...normalize(ipv4, 4), ...normalize(ipv6, 6)] };
+    } catch (error) {
+        return { error };
+    } finally {
+        signal?.removeEventListener('abort', cancel);
+    }
+}
+
 /**
  * Strip the surrounding brackets from an IPv6 literal (e.g. "[::1]" -> "::1").
  * URL.hostname keeps the brackets for IPv6 literals; ipaddr.js and net.isIP
@@ -123,7 +160,7 @@ export function isUrlSafeScheme(urlString) {
  * family is returned; 'family_unavailable' is reported if the host has none.
  *
  * @param {string} hostname
- * @param {{ dnsLookup?: Function, family?: string|number, allowPrivate?: boolean }} [opts]
+ * @param {{ dnsLookup?: Function, family?: string|number, allowPrivate?: boolean, signal?: AbortSignal }} [opts]
  * @returns {Promise<{ok:true, ip:string, family:number} | {ok:false, reason:string, ip?:string, family?:number, error?:Error}>}
  */
 export async function resolveAndCheck(hostname, opts = {}) {
@@ -135,7 +172,7 @@ export async function resolveAndCheck(hostname, opts = {}) {
     const wantFamily = familyToNum(opts.family); // 0 = any family
     const allowPrivate = opts.allowPrivate === true;
 
-    // IP literal short-circuit — no DNS needed.
+    // IP literal short-circuit - no DNS needed.
     if (ipaddr.isValid(host)) {
         const family = host.includes(':') ? 6 : 4;
         if (wantFamily && wantFamily !== family) {
@@ -147,14 +184,26 @@ export async function resolveAndCheck(hostname, opts = {}) {
         return { ok: true, ip: host, family };
     }
 
-    const lookup = opts.dnsLookup || dns.lookup;
-
     let addrs;
-    try {
-        addrs = await lookup(host, { all: true, verbatim: true });
-    } catch (error) {
-        logger.debug({ hostname: host, err: error?.message }, '[SSRF] DNS lookup failed');
-        return { ok: false, reason: 'dns_failure', error };
+    let lookupError;
+    if (opts.dnsLookup) {
+        try {
+            addrs = await opts.dnsLookup(host, { all: true, verbatim: true });
+        } catch (error) {
+            lookupError = error;
+        }
+    } else {
+        const resolved = await resolveWithCancellableResolver(host, wantFamily, opts.signal);
+        addrs = resolved.addresses;
+        lookupError = resolved.error;
+    }
+
+    if (lookupError) {
+        if (opts.signal?.aborted) {
+            return { ok: false, reason: 'aborted', error: lookupError };
+        }
+        logger.debug({ hostname: host, err: lookupError?.message }, '[SSRF] DNS lookup failed');
+        return { ok: false, reason: 'dns_failure', error: lookupError };
     }
 
     if (!Array.isArray(addrs) || addrs.length === 0) {
