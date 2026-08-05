@@ -6,6 +6,7 @@ import { FairScheduler } from './lib/fair-scheduler.js';
 import { closeHttpCheckAgents } from './lib/http-agent-pool.js';
 import { ReportCoalescer } from './lib/report-coalescer.js';
 import { ResourceGovernor } from './lib/resource-governor.js';
+import { EgressDetector } from './lib/egress-detect.js';
 import {
     CHECK_WATCHDOG_BUFFER_MS,
     DEFAULT_MONITOR_TIMEOUT_S,
@@ -131,6 +132,14 @@ export class AgentRuntime {
                 this.scheduler.setPaused(false);
             },
         });
+        this.egress = new EgressDetector({
+            url: config.EGRESS_DETECT_URL,
+            ttlMs: config.EGRESS_DETECT_TTL_MS,
+            timeoutMs: config.EGRESS_DETECT_TIMEOUT_MS,
+            enabled: config.EGRESS_DETECT !== false,
+            skipSslVerify: config.SKIP_SSL_VERIFY === true,
+            logger: this.logger,
+        });
     }
 
     validateConfiguration() {
@@ -207,6 +216,9 @@ export class AgentRuntime {
         this.state.lastPollAttemptAt = new Date();
 
         try {
+            // Non-blocking: refresh cached public egress IPs for the allowlist.
+            this.egress.maybeRefresh(this.shutdownController.signal);
+
             const data = await this.api.getChecks({
                 signal: this.shutdownController.signal,
                 health: this.healthPayload(),
@@ -343,6 +355,7 @@ export class AgentRuntime {
                 validation_failures: this.state.validationFailures,
                 poll_overlap_skips: this.state.pollOverlapSkips,
             },
+            egress: this.egress.snapshot(),
         };
     }
 
@@ -384,10 +397,12 @@ export class AgentRuntime {
         this.validateConfiguration();
         this.startHealthServer();
         this.startGovernor();
+        this.egress.maybeRefresh(this.shutdownController.signal);
         this.logger.info({
             version: this.version,
             sku: this.budgets?.sku || null,
             resources: this.budgets?.detected || null,
+            egress_detect: this.config.EGRESS_DETECT !== false,
             concurrency: {
                 total: this.config.CONCURRENCY_LIMIT,
                 network: this.config.NETWORK_CONCURRENCY,

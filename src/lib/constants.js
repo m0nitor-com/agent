@@ -76,3 +76,9 @@ export const HEALTH_UNHEALTHY_AFTER_FAILED_POLLS = 3;
 export const HEALTH_RESPONSE_MAX_BYTES = 16 * 1024;
 export const SHUTDOWN_FLUSH_TIMEOUT_MS = 5000;
 export const EVENT_LOOP_DELAY_RESOLUTION_MS = 20;
+
+// --- Egress IP discovery (public allowlist source) ---
+// Dual-stack echo endpoint that returns the client IP (cdn-cgi/trace or plain text).
+export const DEFAULT_EGRESS_DETECT_URL = 'https://cloudflare.com/cdn-cgi/trace';
+export const EGRESS_DETECT_TTL_MS = 15 * 60 * 1000;
+export const EGRESS_DETECT_TIMEOUT_MS = 5000;

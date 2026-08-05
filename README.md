@@ -6,6 +6,7 @@ This is the distributed worker agent for [m0nitor.com](https://m0nitor.com). It 
 
 - **Protocol Support**: HTTP(S), Ping (ICMP/ICMPv6), TCP, UDP, DNS, SSH reachability, MySQL/MariaDB, PostgreSQL, Redis, MTR and traceroute.
 - **Dual-Stack**: IPv4 and IPv6 targets, with an optional per-check or global address-family preference.
+- **Egress discovery**: Periodically learns the probe's public IPv4 and IPv6 (for the console allowlist at `/ips.json`).
 - **Secure**: Uses token-based authentication with the m0nitor API.
 - **Resource-aware**: Detects cgroup CPU/memory (with host fallback), selects SKU budgets, micro-batches reports, and governs concurrency from RSS / event-loop lag.
 - **Containerized**: Ready for Docker and Kubernetes deployments.

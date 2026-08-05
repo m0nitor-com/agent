@@ -22,6 +22,7 @@ function baseConfig(overrides = {}) {
         HTTP_MAX_FREE_SOCKETS: 2,
         SHUTDOWN_FLUSH_TIMEOUT: 50,
         HEALTH_PORT: 0,
+        EGRESS_DETECT: false,
         ...overrides,
     };
 }
