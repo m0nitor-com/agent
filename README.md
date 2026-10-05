@@ -110,6 +110,7 @@ All configuration is done via environment variables.
 | `LOG_LEVEL` | Logging verbosity (`debug`, `info`, `warn`, `error`) | `info` |
 | `POLL_INTERVAL`| Time between check cycles in milliseconds | `5000` |
 | `POLL_MAX_INTERVAL` | Cap for exponential backoff under consecutive poll failures (ms). Worker rate-limits its API polls when the console is unreachable, capping the delay here. Set equal to `POLL_INTERVAL` to disable backoff. | `300000` |
+| `ADHOC_POLL_INTERVAL` | Fast-lane poll interval for on-demand checks (network check, admin probe test) in milliseconds. Runs independently of the main cycle. `0` disables it; on-demand work then arrives with the main poll. | `1000` |
 | `SKIP_SSL_VERIFY` | Skip SSL certificate verification (**INSECURE**) | `false` |
 | `ALLOW_PRIVATE_TARGETS` | Global override for the SSRF guard - when `true`, the worker will accept monitor targets that resolve to private/reserved IP ranges (RFC1918, loopback, link-local, IPv6 ULA/link-local, etc.). Intended for self-hosted operators monitoring a trusted LAN. A per-monitor `allow_private_target` flag takes precedence. **Leave `false` unless you trust every monitor target.** | `false` |
 | `IP_FAMILY` | Default address family for checks when a monitor does not request one (`auto`, `ipv4`, `ipv6`). `auto` lets the OS choose; a per-monitor family always takes precedence. | `auto` |

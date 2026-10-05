@@ -152,6 +152,15 @@ class ApiClient {
     }
 
     /**
+     * Fetch only pending on-demand checks (fast lane). No retries: the next
+     * tick a second later is the retry.
+     */
+    async getAdhocChecks(options = {}) {
+        const response = await this.client.get('/workers/adhoc', { signal: options.signal });
+        return response.data;
+    }
+
+    /**
      * Report a check result to the backend
      */
     async reportCheck(result, options = {}) {

@@ -186,6 +186,68 @@ describe('AgentRuntime', () => {
         await runtime.shutdown('test');
     });
 
+    it('fast lane runs on-demand checks and the main poll skips them while in flight', async () => {
+        let releaseCheck;
+        const gate = new Promise((resolve) => { releaseCheck = resolve; });
+        const registry = new CheckRegistry().register('fake', {
+            capability: 'fake',
+            budget: 'network',
+            validate: (raw) => raw,
+            handler: async (monitor) => {
+                await gate;
+                return { monitor_id: monitor.id, is_success: true, response_time_ms: 1 };
+            },
+        });
+        const adhoc = { id: -5, type: 'fake', timeout: 1 };
+        const api = {
+            getAdhocChecks: vi.fn().mockResolvedValue({ monitors: [adhoc] }),
+            getChecks: vi.fn().mockResolvedValue({ monitors: [adhoc] }),
+            close: vi.fn(),
+        };
+        const resultQueue = {
+            submitBatch: vi.fn().mockResolvedValue(true),
+            flush: vi.fn().mockResolvedValue(true),
+            dropOldest: vi.fn().mockReturnValue(0),
+            size: 0,
+            telemetry: { size: 0, bytes: 0, counters: {} },
+        };
+        const runtime = new AgentRuntime({
+            config: baseConfig({ ADHOC_POLL_INTERVAL: 10_000, REPORT_BATCH_MAX_SIZE: 50, REPORT_COALESCE_IDLE_MS: 5000 }),
+            logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+            registry,
+            api,
+            resultQueue,
+            version: 'test',
+        });
+
+        const lane = runtime.runAdhocLoop();
+        await vi.waitFor(() => expect(runtime.adhocInFlight.has(-5)).toBe(true));
+
+        // Main poll carries the same leg (older console path): must not rerun it.
+        await runtime.pollOnce();
+
+        releaseCheck();
+        // Reported immediately, not after the 5s coalescing window.
+        await vi.waitFor(() => expect(resultQueue.submitBatch).toHaveBeenCalledTimes(1));
+        expect(resultQueue.submitBatch.mock.calls[0][0]).toEqual([
+            expect.objectContaining({ monitor_id: -5, is_success: true }),
+        ]);
+        expect(runtime.state.totalChecks).toBe(1);
+
+        await runtime.shutdown('test');
+        await lane;
+    });
+
+    it('fast lane retires quietly on a console without the endpoint', async () => {
+        const { runtime, api } = createRuntime({
+            getAdhocChecks: vi.fn().mockRejectedValue({ response: { status: 404 } }),
+        }, { ADHOC_POLL_INTERVAL: 10 });
+
+        await runtime.runAdhocLoop();
+        expect(api.getAdhocChecks).toHaveBeenCalledTimes(1);
+        await runtime.shutdown('test');
+    });
+
     it('executes registered checks and submits settled results', async () => {
         const { runtime, resultQueue } = createRuntime({
             getChecks: vi.fn().mockResolvedValue({

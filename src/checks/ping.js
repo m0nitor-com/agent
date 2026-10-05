@@ -22,7 +22,9 @@ function runPingProcess(target, family, timeoutSeconds, context) {
         const isWindows = process.platform === 'win32';
         const args = isWindows
             ? [...(family === 6 ? ['-6'] : ['-4']), '-n', String(PING_COUNT), '-w', String(timeoutSeconds * 1000), target]
-            : ['-n', ...(family === 6 ? ['-6'] : []), '-c', String(PING_COUNT), '-W', String(timeoutSeconds), target];
+            // -i 0.2: the fastest interval iputils allows without root. Default
+            // 1s made every ping check sit idle for two seconds.
+            : ['-n', ...(family === 6 ? ['-6'] : []), '-c', String(PING_COUNT), '-i', '0.2', '-W', String(timeoutSeconds), target];
         const child = spawn('ping', args, {
             shell: false,
             windowsHide: true,

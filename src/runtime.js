@@ -67,6 +67,11 @@ export class AgentRuntime {
         this.healthServer = null;
         this.loopPromise = null;
         this.currentPoll = null;
+        this.adhocLoopPromise = null;
+        // On-demand ids taken by either loop and not yet settled, so the main
+        // poll (which still carries adhoc work for older consoles) never runs
+        // a leg the fast lane already has.
+        this.adhocInFlight = new Set();
         this.isPolling = false;
         this.isShuttingDown = false;
         this.governorTimer = null;
@@ -236,20 +241,7 @@ export class AgentRuntime {
                 }
             }
 
-            const rawMonitors = Array.isArray(data.monitors) ? data.monitors : [];
-            const monitors = [];
-            for (const raw of rawMonitors) {
-                const validated = this.registry.validate(raw);
-                if (validated.ok) {
-                    monitors.push(validated.monitor);
-                } else {
-                    this.state.validationFailures++;
-                    this.logger.warn({
-                        monitor_id: raw?.id,
-                        type: typeof raw?.type === 'string' ? raw.type.slice(0, 30) : null,
-                    }, '[VALIDATOR] Skipping invalid monitor');
-                }
-            }
+            const monitors = this.validateMonitors(data.monitors);
             if (monitors.length === 0) return data.poll_after_ms || null;
 
             this.logger.info({
@@ -257,20 +249,7 @@ export class AgentRuntime {
                 location: data.location?.code,
             }, '[POLL] Received checks');
 
-            await this.scheduler.run(
-                monitors,
-                (monitor) => this.registry.budgetFor(monitor.type),
-                (monitor) => this.executeCheck(monitor),
-                {
-                    onResult: (result) => {
-                        this.state.totalChecks++;
-                        if (!result?.is_success) this.state.checkFailures++;
-                        this.logSettled(result);
-                        this.coalescer.push(result, { signal: this.shutdownController.signal });
-                    },
-                },
-            );
-            await this.coalescer.flush({ signal: this.shutdownController.signal });
+            await this.runMonitors(monitors);
             return data.poll_after_ms || null;
         } catch (error) {
             if (this.isShuttingDown || this.shutdownController.signal.aborted) return null;
@@ -285,6 +264,92 @@ export class AgentRuntime {
             throw error;
         } finally {
             this.isPolling = false;
+        }
+    }
+
+    validateMonitors(rawMonitors) {
+        const monitors = [];
+        for (const raw of Array.isArray(rawMonitors) ? rawMonitors : []) {
+            // Negative id = on-demand leg; skip one the other loop already runs.
+            if (raw?.id < 0 && this.adhocInFlight.has(raw.id)) continue;
+            const validated = this.registry.validate(raw);
+            if (validated.ok) {
+                monitors.push(validated.monitor);
+            } else {
+                this.state.validationFailures++;
+                this.logger.warn({
+                    monitor_id: raw?.id,
+                    type: typeof raw?.type === 'string' ? raw.type.slice(0, 30) : null,
+                }, '[VALIDATOR] Skipping invalid monitor');
+            }
+        }
+        return monitors;
+    }
+
+    async runMonitors(monitors) {
+        const adhocIds = monitors.filter((m) => m.id < 0).map((m) => m.id);
+        adhocIds.forEach((id) => this.adhocInFlight.add(id));
+        try {
+            await this.scheduler.run(
+                monitors,
+                (monitor) => this.registry.budgetFor(monitor.type),
+                (monitor) => this.executeCheck(monitor),
+                {
+                    onResult: (result) => {
+                        this.state.totalChecks++;
+                        if (!result?.is_success) this.state.checkFailures++;
+                        this.logSettled(result);
+                        this.coalescer.push(result, { signal: this.shutdownController.signal });
+                        // Someone is watching an on-demand leg live: send now,
+                        // not after the coalescing window.
+                        if (result?.monitor_id < 0) this.coalescer.scheduleFlush({ signal: this.shutdownController.signal });
+                    },
+                },
+            );
+            await this.coalescer.flush({ signal: this.shutdownController.signal });
+        } finally {
+            // Held a little past completion: a main poll fetched before the
+            // report landed may still carry the id.
+            const release = setTimeout(() => adhocIds.forEach((id) => this.adhocInFlight.delete(id)), 30_000);
+            release.unref?.();
+        }
+    }
+
+    /**
+     * Fast lane: pick up on-demand checks within a second, independent of the
+     * main cycle (which waits for every scheduled check before polling again).
+     * Each batch runs detached, so a slow target never delays the next pickup.
+     * A console without /workers/adhoc answers 404 once and the lane retires;
+     * adhoc work then still arrives through the main poll.
+     */
+    async runAdhocLoop() {
+        const interval = this.config.ADHOC_POLL_INTERVAL;
+        if (!(interval > 0) || typeof this.api.getAdhocChecks !== 'function') return;
+
+        let failures = 0;
+        while (!this.isShuttingDown) {
+            try {
+                const data = await this.api.getAdhocChecks({ signal: this.shutdownController.signal });
+                failures = 0;
+                const monitors = this.validateMonitors(data?.monitors);
+                if (monitors.length > 0) {
+                    this.runMonitors(monitors).catch((error) => {
+                        this.logger.warn(safeError(error), '[ADHOC] Run failed');
+                    });
+                }
+            } catch (error) {
+                if (this.isShuttingDown) return;
+                const status = error?.response?.status;
+                if (status === 404 || status === 401) {
+                    this.logger.info({ status }, '[ADHOC] Fast lane unavailable, using main poll only');
+                    return;
+                }
+                failures++;
+            }
+            const delay = failures > 0
+                ? computeNextPollDelay(interval, this.config.POLL_MAX_INTERVAL, failures)
+                : interval;
+            await interruptibleDelay(delay, this.shutdownController.signal);
         }
     }
 
@@ -424,6 +489,7 @@ export class AgentRuntime {
                 hard_rss_bytes: this.config.HARD_RSS_BYTES,
             },
         }, '[AGENT] Started');
+        this.adhocLoopPromise = this.runAdhocLoop();
         this.loopPromise = this.runLoop();
         return this.loopPromise;
     }
@@ -444,6 +510,9 @@ export class AgentRuntime {
         }
         if (this.currentPoll) {
             try { await this.currentPoll; } catch { /* poll error already recorded */ }
+        }
+        if (this.adhocLoopPromise) {
+            try { await this.adhocLoopPromise; } catch { /* loop errors already logged */ }
         }
         await this.coalescer.flush({ signal: AbortSignal.timeout?.(this.config.SHUTDOWN_FLUSH_TIMEOUT) });
         const flushed = await this.resultQueue.flush(this.config.SHUTDOWN_FLUSH_TIMEOUT);
