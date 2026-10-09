@@ -3,7 +3,8 @@ import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { computeNextPollDelay } from './lib/backoff.js';
 import { executeWithContext } from './lib/execution-context.js';
 import { FairScheduler } from './lib/fair-scheduler.js';
-import { closeHttpCheckAgents } from './lib/http-agent-pool.js';
+import { computeFullBudgets, normalizeBudgets } from './lib/budgets.js';
+import { closeHttpCheckAgents, configureHttpCheckAgents } from './lib/http-agent-pool.js';
 import { ReportCoalescer } from './lib/report-coalescer.js';
 import { ResourceGovernor } from './lib/resource-governor.js';
 import { EgressDetector } from './lib/egress-detect.js';
@@ -172,6 +173,52 @@ export class AgentRuntime {
         }
     }
 
+    applyRemoteBudgets(remote) {
+        if (!remote || typeof remote !== 'object' || remote.profile !== 'full') return;
+        const detected = this.budgets?.detected;
+        if (!detected?.cpus || !detected?.memoryGiB) return;
+
+        const next = normalizeBudgets(computeFullBudgets(
+            detected.cpus,
+            detected.memoryGiB,
+            detected.memoryBytes,
+            remote,
+        ));
+        const signature = [
+            next.total,
+            next.network,
+            next.database,
+            next.diagnostic,
+            next.httpMaxSockets,
+            next.httpMaxFreeSockets,
+        ].join(':');
+        if (signature === this.remoteBudgetSignature) return;
+        this.remoteBudgetSignature = signature;
+
+        this.governor?.setBaseLimits({
+            total: next.total,
+            network: next.network,
+            database: next.database,
+            diagnostic: next.diagnostic,
+        }, {
+            softRssBytes: next.softRssBytes,
+            hardRssBytes: next.hardRssBytes,
+        });
+        configureHttpCheckAgents({
+            maxSockets: next.httpMaxSockets,
+            maxFreeSockets: next.httpMaxFreeSockets,
+        });
+        this.logger?.info({
+            total: next.total,
+            network: next.network,
+            database: next.database,
+            diagnostic: next.diagnostic,
+            http_max_sockets: next.httpMaxSockets,
+            cpus: detected.cpus,
+            memory_gib: detected.memoryGiB,
+        }, '[AGENT] Applied budgets from the console');
+    }
+
     async executeCheck(monitor) {
         const entry = this.registry.get(monitor.type);
         if (!entry) {
@@ -230,6 +277,8 @@ export class AgentRuntime {
             });
             this.state.consecutiveFailedPolls = 0;
             this.state.lastSuccessfulPollAt = new Date();
+
+            this.applyRemoteBudgets(data.worker?.budgets);
 
             if (data.worker?.latest_version && data.worker.latest_version !== this.version) {
                 if (this.state.latestAvailableVersion !== data.worker.latest_version) {

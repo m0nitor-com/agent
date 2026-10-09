@@ -4,6 +4,7 @@ import {
     classifySku,
     computeBudgets,
     computeFormulaBudgets,
+    computeFullBudgets,
     normalizeBudgets,
 } from '../src/lib/budgets.js';
 
@@ -15,35 +16,35 @@ describe('budgets', () => {
         expect(classifySku(8, 16)).toBeNull();
     });
 
-    it('lands on the published SKU table for matching resources', () => {
+    it('fills the detected machine unless a SKU is forced', () => {
         const one = computeBudgets({
             cpus: 1,
             memoryBytes: 1024 ** 3,
             memoryGiB: 1,
             source: { cpu: 'cgroup', memory: 'cgroup' },
         });
-        expect(one.sku).toBe('sku-1c1g');
-        expect(one).toMatchObject(SKU_PROFILES['sku-1c1g']);
+        expect(one.sku).toBe('full');
+        expect(one.total).toBe(48);
+        expect(one.network).toBe(46);
+        expect(one.httpMaxSockets).toBe(46);
 
-        const two = computeBudgets({
-            cpus: 2,
-            memoryBytes: 2 * 1024 ** 3,
-            memoryGiB: 2,
+        const pinned = computeBudgets({
+            cpus: 1,
+            memoryBytes: 1024 ** 3,
+            memoryGiB: 1,
             source: { cpu: 'cgroup', memory: 'cgroup' },
-        });
-        expect(two.sku).toBe('sku-2c2g');
-        expect(two.total).toBe(28);
-        expect(two.httpMaxSockets).toBe(12);
+        }, { sku: 'sku-1c1g' });
+        expect(pinned.sku).toBe('sku-1c1g');
+        expect(pinned).toMatchObject(SKU_PROFILES['sku-1c1g']);
+    });
 
-        const four = computeBudgets({
-            cpus: 2,
-            memoryBytes: 4 * 1024 ** 3,
-            memoryGiB: 4,
-            source: { cpu: 'cgroup', memory: 'cgroup' },
+    it('scales the full profile with the console coefficients', () => {
+        const doubled = computeFullBudgets(2, 4, 4 * 1024 ** 3, {
+            total_per_cpu: 48,
+            socket_ratio: 1,
         });
-        expect(four.sku).toBe('sku-2c4g');
-        expect(four.total).toBe(40);
-        expect(four.diagnostic).toBe(2);
+        expect(doubled.total).toBe(96);
+        expect(doubled.httpMaxSockets).toBe(doubled.network);
     });
 
     it('uses the documented formula outside named SKUs', () => {

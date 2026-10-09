@@ -6,6 +6,21 @@ function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
 
+/**
+ * Pulled from the console on each poll (worker.budgets). Checks wait on the
+ * network, so one core can hold many of them. The governor still steps down
+ * when RSS or the event loop actually gets tight.
+ */
+export const FULL_BUDGET_DEFAULTS = Object.freeze({
+    totalPerCpu: 48,
+    minTotal: 32,
+    maxTotal: 256,
+    socketRatio: 1,
+    maxDatabase: 8,
+    softRssRatio: 0.55,
+    hardRssRatio: 0.8,
+});
+
 function round(value) {
     return Math.round(value);
 }
@@ -83,6 +98,8 @@ export function classifySku(cpus, memoryGiB) {
  * diag  = memGiB >= 3.5 ? 2 : 1
  * network = max(4, total - db - diag)
  * http_max_sockets = clamp(ceil(network * 0.5), 4, 24)
+ *
+ * Kept for an explicit comparison. Auto-detected probes use computeFullBudgets.
  */
 export function computeFormulaBudgets(cpus, memoryGiB, memoryBytes) {
     const safeCpus = Math.max(0.25, cpus);
@@ -119,12 +136,49 @@ export function computeFormulaBudgets(cpus, memoryGiB, memoryBytes) {
 }
 
 /**
- * Normalize ENV overrides so network/db/diag stay within total and
- * http sockets stay coupled to the network budget.
+ * Budgets that fill the machine the probe is actually running on.
+ * HTTP sockets track the network budget one-to-one. The old half-ratio left
+ * slow HTTPS checks queued behind a handful of sockets.
+ *
+ * @param {object} profile console worker.budgets, or FULL_BUDGET_DEFAULTS
  */
+export function computeFullBudgets(cpus, memoryGiB, memoryBytes, profile = {}) {
+    const perCpu = clamp(Number(profile.total_per_cpu ?? profile.totalPerCpu) || FULL_BUDGET_DEFAULTS.totalPerCpu, 8, 128);
+    const minTotal = clamp(Number(profile.min_total ?? profile.minTotal) || FULL_BUDGET_DEFAULTS.minTotal, 8, 256);
+    const maxTotal = clamp(Number(profile.max_total ?? profile.maxTotal) || FULL_BUDGET_DEFAULTS.maxTotal, minTotal, 512);
+    const socketRatio = clamp(Number(profile.socket_ratio ?? profile.socketRatio) || FULL_BUDGET_DEFAULTS.socketRatio, 0.25, 1);
+    const maxDatabase = clamp(Number(profile.max_database ?? profile.maxDatabase) || FULL_BUDGET_DEFAULTS.maxDatabase, 1, 16);
+    const safeCpus = Math.max(0.25, cpus);
+    const safeMemGiB = Math.max(0.25, memoryGiB);
+    const total = clamp(round(perCpu * safeCpus), minTotal, maxTotal);
+    const database = clamp(round(safeCpus), 1, Math.min(maxDatabase, total));
+    const diagnostic = safeMemGiB >= 2 ? 2 : 1;
+    const network = Math.max(4, total - database - diagnostic);
+    const httpMaxSockets = clamp(Math.ceil(network * socketRatio), 8, network);
+    const httpMaxFreeSockets = clamp(Math.ceil(httpMaxSockets / 4), 2, 16);
+    const bytes = memoryBytes > 0 ? memoryBytes : Math.round(safeMemGiB * GiB);
+
+    return {
+        id: 'full',
+        label: `full ${safeCpus.toFixed(2)}c/${safeMemGiB.toFixed(2)}GiB`,
+        total,
+        network,
+        database,
+        diagnostic,
+        httpMaxSockets,
+        httpMaxFreeSockets,
+        queueEntries: clamp(round(safeMemGiB * 500), 500, 4000),
+        queueBytes: clamp(round(safeMemGiB * 8) * MiB, 8 * MiB, 32 * MiB),
+        batchSize: 100,
+        batchBytes: 1 * MiB,
+        softRssBytes: Math.round(bytes * FULL_BUDGET_DEFAULTS.softRssRatio),
+        hardRssBytes: Math.round(bytes * FULL_BUDGET_DEFAULTS.hardRssRatio),
+    };
+}
+
 export function normalizeBudgets(input) {
-    const total = clamp(round(Number(input.total) || 8), 1, 64);
-    const database = clamp(round(Number(input.database) || 1), 1, Math.min(4, total));
+    const total = clamp(round(Number(input.total) || 8), 1, 512);
+    const database = clamp(round(Number(input.database) || 1), 1, Math.min(8, total));
     const diagnostic = clamp(round(Number(input.diagnostic) || 1), 1, Math.min(4, total));
     let network = clamp(round(Number(input.network) || 4), 1, total);
     if (network + database + diagnostic > total) {
@@ -133,12 +187,12 @@ export function normalizeBudgets(input) {
     const httpMaxSockets = clamp(
         round(Number(input.httpMaxSockets) || Math.ceil(network * 0.5)),
         4,
-        Math.min(24, Math.max(4, network)),
+        Math.min(512, Math.max(4, network)),
     );
     const httpMaxFreeSockets = clamp(
         round(Number(input.httpMaxFreeSockets) || Math.ceil(httpMaxSockets / 4)),
         1,
-        Math.min(4, httpMaxSockets),
+        Math.min(16, httpMaxSockets),
     );
 
     return {
@@ -159,21 +213,22 @@ export function normalizeBudgets(input) {
 }
 
 /**
- * Compute budgets from detected resources, preferring named SKU profiles.
+ * Compute budgets from detected resources.
+ * A named SKU is used only when AGENT_SKU forces one. Otherwise the probe
+ * takes the full profile for the CPU and memory it can see.
  */
 export function computeBudgets(resources, options = {}) {
     const cpus = resources.cpus;
     const memoryGiB = resources.memoryGiB;
     const memoryBytes = resources.memoryBytes;
     const forcedSku = options.sku && SKU_PROFILES[options.sku] ? options.sku : null;
-    const skuId = forcedSku || classifySku(cpus, memoryGiB);
-    const base = skuId
-        ? { ...SKU_PROFILES[skuId] }
-        : computeFormulaBudgets(cpus, memoryGiB, memoryBytes);
+    const base = forcedSku
+        ? { ...SKU_PROFILES[forcedSku] }
+        : computeFullBudgets(cpus, memoryGiB, memoryBytes, options.profile);
 
     return {
         ...normalizeBudgets(base),
-        sku: skuId || 'formula',
+        sku: forcedSku || 'full',
         detected: {
             cpus,
             memoryBytes,

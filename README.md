@@ -115,7 +115,7 @@ All configuration is done via environment variables.
 | `ALLOW_PRIVATE_TARGETS` | Global override for the SSRF guard - when `true`, the worker will accept monitor targets that resolve to private/reserved IP ranges (RFC1918, loopback, link-local, IPv6 ULA/link-local, etc.). Intended for self-hosted operators monitoring a trusted LAN. A per-monitor `allow_private_target` flag takes precedence. **Leave `false` unless you trust every monitor target.** | `false` |
 | `IP_FAMILY` | Default address family for checks when a monitor does not request one (`auto`, `ipv4`, `ipv6`). `auto` lets the OS choose; a per-monitor family always takes precedence. | `auto` |
 | `HEALTH_PORT` | Port for the built-in health-check HTTP server (`/health`). | `8080` |
-| `AGENT_SKU` | Force a SKU profile (`sku-1c1g`, `sku-2c2g`, `sku-2c4g`). Empty = auto-detect from cgroup/host. | auto |
+| `AGENT_SKU` | Optional pin to a small SKU (`sku-1c1g`, `sku-2c2g`, `sku-2c4g`). Empty = use the full profile for the CPU and memory this process can see. A `worker.budgets` block from the console replaces that on the next poll. | full |
 | `CONCURRENCY_LIMIT` | Maximum number of active checks across all budgets. | SKU / formula |
 | `NETWORK_CONCURRENCY` | Concurrent lightweight network checks. | SKU / formula |
 | `DATABASE_CONCURRENCY` | Concurrent database connections. No pools are retained. | SKU / formula |
@@ -134,15 +134,20 @@ All configuration is done via environment variables.
 
 ### Scale budgets (auto-selected)
 
-The agent prefers named SKUs when cgroup/host resources match; otherwise it uses
-`total = clamp(round(8 + 8*cpus + 4*memGiB), 8, 64)` with related network/db/diag
-and HTTP socket coupling.
+By default the probe uses the full profile for the CPU and memory it can see:
+`total = clamp(48 * cpus, 32, 256)`, database about one per core, diagnostics 1
+or 2, and HTTP sockets equal to the network budget. The console publishes the
+coefficients on `worker.budgets` and the probe applies them on the next poll.
+Named SKUs stay available only when `AGENT_SKU` pins one.
 
-| SKU | total | network | db | diag | HTTP sockets | Queue entries / bytes | Batch size / bytes | Soft RSS | Hard RSS |
-|-----|------:|--------:|---:|-----:|-------------:|----------------------:|-------------------:|---------:|---------:|
-| 1c/1GB | 16 | 13 | 2 | 1 | 6 | 500 / 4 MiB | 50 / 512 KiB | 350 MiB | 550 MiB |
-| 2c/2GB | 28 | 24 | 3 | 1 | 12 | 1000 / 8 MiB | 100 / 1 MiB | 700 MiB | 1.2 GiB |
-| 2c/4GB | 40 | 34 | 4 | 2 | 16 | 1500 / 12 MiB | 100 / 1 MiB | 1.5 GiB | 2.8 GiB |
+| Shape | total | network | HTTP sockets |
+|-------|------:|--------:|-------------:|
+| 1 core | 48 | 46 | 46 |
+| 2 cores | 96 | 92 | 92 |
+| 4 cores | 192 | 186 | 186 |
+
+Soft RSS is 55% of detected memory and hard RSS is 80%. Past the soft line the
+governor steps concurrency down. Past the hard line it pauses.
 
 ENV overrides still work, then are normalized so network/db/diag and HTTP sockets
 stay within the total budget.

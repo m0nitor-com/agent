@@ -57,6 +57,25 @@ export class ResourceGovernor {
         return { ...this.effective };
     }
 
+    /**
+     * Replace the ceiling the probe pulled from the console. A governor that
+     * has already stepped down keeps that step and aims at the new ceiling.
+     */
+    setBaseLimits(limits, { softRssBytes, hardRssBytes } = {}) {
+        this.baseLimits = {
+            total: Math.max(1, limits.total),
+            network: Math.max(1, limits.network),
+            database: Math.max(1, limits.database),
+            diagnostic: Math.max(1, limits.diagnostic),
+        };
+        if (softRssBytes > 0) this.softRssBytes = softRssBytes;
+        if (hardRssBytes > this.softRssBytes) this.hardRssBytes = hardRssBytes;
+        if (this.reductionSteps === 0 && !this.paused) {
+            this.effective = { ...this.baseLimits };
+            this.applyLimits('remote_budgets');
+        }
+    }
+
     telemetry() {
         return {
             paused: this.paused,
