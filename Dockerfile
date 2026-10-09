@@ -1,5 +1,6 @@
-# Use a current Node.js 24 Alpine base for a small footprint (satisfies engines >=22)
-FROM node:24-alpine
+# Node 24 Alpine via the public ECR mirror. Docker Hub anonymous pulls were
+# rate-limited and timing out on the publish workflow.
+FROM public.ecr.aws/docker/library/node:24-alpine
 
 # Set working directory
 WORKDIR /app
