@@ -159,6 +159,7 @@ describe('AgentRuntime', () => {
 
         releaseSecond();
         await poll;
+        await runtime.idle();
 
         expect(resultQueue.submitBatch).toHaveBeenCalledTimes(2);
         expect(submitOrder).toEqual([[1], [2]]);
@@ -180,6 +181,7 @@ describe('AgentRuntime', () => {
         });
 
         await runtime.pollOnce();
+        await runtime.idle();
         expect(resultQueue.submitBatch).toHaveBeenCalledTimes(1);
         expect(resultQueue.submitBatch.mock.calls[0][0]).toHaveLength(2);
         expect(resultQueue.submitBatch.mock.calls[0][1]).toMatchObject({ retries: 0 });
@@ -248,6 +250,107 @@ describe('AgentRuntime', () => {
         await runtime.shutdown('test');
     });
 
+    it('a slow check does not hold back the next poll', async () => {
+        let releaseSlow;
+        const slowGate = new Promise((resolve) => { releaseSlow = resolve; });
+        const started = [];
+        const registry = new CheckRegistry().register('fake', {
+            capability: 'fake',
+            budget: 'network',
+            validate: (raw) => raw,
+            handler: async (monitor) => {
+                started.push(monitor.id);
+                if (monitor.id === 1) await slowGate;
+                return { monitor_id: monitor.id, is_success: true, response_time_ms: 1 };
+            },
+        });
+        const api = {
+            getChecks: vi.fn()
+                .mockResolvedValueOnce({ monitors: [{ id: 1, type: 'fake', timeout: 30 }] })
+                .mockResolvedValueOnce({ monitors: [{ id: 2, type: 'fake', timeout: 30 }] }),
+            close: vi.fn(),
+        };
+        const resultQueue = {
+            submitBatch: vi.fn().mockResolvedValue(true),
+            flush: vi.fn().mockResolvedValue(true),
+            dropOldest: vi.fn().mockReturnValue(0),
+            size: 0,
+            telemetry: { size: 0, bytes: 0, counters: {} },
+        };
+        const runtime = new AgentRuntime({
+            config: baseConfig({ CONCURRENCY_LIMIT: 4, NETWORK_CONCURRENCY: 4 }),
+            logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+            registry,
+            api,
+            resultQueue,
+            version: 'test',
+        });
+
+        // The first poll returns while monitor 1 is still running.
+        await runtime.pollOnce();
+        expect(started).toEqual([1]);
+
+        // So the second poll runs right away and monitor 2 is not blocked.
+        await runtime.pollOnce();
+        await vi.waitFor(() => expect(started).toEqual([1, 2]));
+        // Monitor 2 settles while monitor 1 is still running.
+        await vi.waitFor(() => expect(runtime.state.totalChecks).toBe(1));
+
+        releaseSlow();
+        await runtime.idle();
+        expect(runtime.state.totalChecks).toBe(2);
+        await runtime.shutdown('test');
+    });
+
+    it('does not start a scheduled leg twice while it is still running', async () => {
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const handler = vi.fn(async (monitor) => {
+            await gate;
+            return { monitor_id: monitor.id, is_success: true, response_time_ms: 1 };
+        });
+        const registry = new CheckRegistry().register('fake', {
+            capability: 'fake',
+            budget: 'network',
+            validate: (raw) => raw,
+            handler,
+        });
+        const leg = { id: 9, type: 'fake', timeout: 30, family: 'ipv4' };
+        const otherFamily = { id: 9, type: 'fake', timeout: 30, family: 'ipv6' };
+        const api = {
+            getChecks: vi.fn()
+                .mockResolvedValueOnce({ monitors: [leg] })
+                .mockResolvedValueOnce({ monitors: [leg, otherFamily] }),
+            close: vi.fn(),
+        };
+        const resultQueue = {
+            submitBatch: vi.fn().mockResolvedValue(true),
+            flush: vi.fn().mockResolvedValue(true),
+            dropOldest: vi.fn().mockReturnValue(0),
+            size: 0,
+            telemetry: { size: 0, bytes: 0, counters: {} },
+        };
+        const runtime = new AgentRuntime({
+            config: baseConfig({ CONCURRENCY_LIMIT: 4, NETWORK_CONCURRENCY: 4 }),
+            logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+            registry,
+            api,
+            resultQueue,
+            version: 'test',
+        });
+
+        await runtime.pollOnce();
+        await runtime.pollOnce();
+        // The ipv4 leg is still running, so only the ipv6 leg is added.
+        await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+        expect(handler.mock.calls.map(([monitor]) => monitor.family)).toEqual(['ipv4', 'ipv6']);
+
+        release();
+        await runtime.idle();
+        expect(runtime.scheduledInFlight.size).toBe(0);
+        await runtime.shutdown('test');
+    });
+
     it('executes registered checks and submits settled results', async () => {
         const { runtime, resultQueue } = createRuntime({
             getChecks: vi.fn().mockResolvedValue({
@@ -256,6 +359,7 @@ describe('AgentRuntime', () => {
         });
 
         await runtime.pollOnce();
+        await runtime.idle();
         expect(resultQueue.submitBatch).toHaveBeenCalledWith(
             [expect.objectContaining({ monitor_id: 7, is_success: true })],
             expect.objectContaining({ signal: expect.any(AbortSignal), retries: 0 }),

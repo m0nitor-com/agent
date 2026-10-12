@@ -73,6 +73,12 @@ export class AgentRuntime {
         // poll (which still carries adhoc work for older consoles) never runs
         // a leg the fast lane already has.
         this.adhocInFlight = new Set();
+        // Scheduled legs (monitor id + family) that are queued or running. A
+        // poll no longer waits for the slowest check, so the next poll can
+        // return a leg that is still in flight here; it is skipped, not run twice.
+        this.scheduledInFlight = new Set();
+        // Detached runs started by pollOnce(); shutdown waits for them.
+        this.inFlightRuns = new Set();
         this.isPolling = false;
         this.isShuttingDown = false;
         this.governorTimer = null;
@@ -298,7 +304,14 @@ export class AgentRuntime {
                 location: data.location?.code,
             }, '[POLL] Received checks');
 
-            await this.runMonitors(monitors);
+            // Detached: the poll returns as soon as the work is queued. A slow
+            // check no longer holds back the next poll, so every other monitor
+            // keeps its interval. Shutdown waits for these runs.
+            const run = this.runMonitors(monitors).catch((error) => {
+                this.logger.warn(safeError(error), '[POLL] Run failed');
+            });
+            this.inFlightRuns.add(run);
+            void run.finally(() => this.inFlightRuns.delete(run));
             return data.poll_after_ms || null;
         } catch (error) {
             if (this.isShuttingDown || this.shutdownController.signal.aborted) return null;
@@ -316,11 +329,24 @@ export class AgentRuntime {
         }
     }
 
+    /** Resolves once every run started by pollOnce() has settled. */
+    async idle() {
+        while (this.inFlightRuns.size > 0) {
+            await Promise.allSettled([...this.inFlightRuns]);
+        }
+    }
+
+    static legKey(monitor) {
+        return `${monitor?.id}:${monitor?.family || ''}`;
+    }
+
     validateMonitors(rawMonitors) {
         const monitors = [];
         for (const raw of Array.isArray(rawMonitors) ? rawMonitors : []) {
             // Negative id = on-demand leg; skip one the other loop already runs.
             if (raw?.id < 0 && this.adhocInFlight.has(raw.id)) continue;
+            // A scheduled leg still queued or running from an earlier poll.
+            if (raw?.id > 0 && this.scheduledInFlight.has(AgentRuntime.legKey(raw))) continue;
             const validated = this.registry.validate(raw);
             if (validated.ok) {
                 monitors.push(validated.monitor);
@@ -338,13 +364,17 @@ export class AgentRuntime {
     async runMonitors(monitors) {
         const adhocIds = monitors.filter((m) => m.id < 0).map((m) => m.id);
         adhocIds.forEach((id) => this.adhocInFlight.add(id));
+        const legKeys = monitors.filter((m) => m.id > 0).map((m) => AgentRuntime.legKey(m));
+        legKeys.forEach((key) => this.scheduledInFlight.add(key));
         try {
             await this.scheduler.run(
                 monitors,
                 (monitor) => this.registry.budgetFor(monitor.type),
                 (monitor) => this.executeCheck(monitor),
                 {
-                    onResult: (result) => {
+                    onResult: (result, index) => {
+                        const settled = monitors[index];
+                        if (settled?.id > 0) this.scheduledInFlight.delete(AgentRuntime.legKey(settled));
                         this.state.totalChecks++;
                         if (!result?.is_success) this.state.checkFailures++;
                         this.logSettled(result);
@@ -357,6 +387,8 @@ export class AgentRuntime {
             );
             await this.coalescer.flush({ signal: this.shutdownController.signal });
         } finally {
+            // A run that ends early (shutdown) must not leave legs locked.
+            legKeys.forEach((key) => this.scheduledInFlight.delete(key));
             // Held a little past completion: a main poll fetched before the
             // report landed may still carry the id.
             const release = setTimeout(() => adhocIds.forEach((id) => this.adhocInFlight.delete(id)), 30_000);
@@ -559,6 +591,11 @@ export class AgentRuntime {
         }
         if (this.currentPoll) {
             try { await this.currentPoll; } catch { /* poll error already recorded */ }
+        }
+        // Runs are detached from the poll; let in-flight checks settle
+        // (the shutdown signal aborts them) so their results can be flushed.
+        if (this.inFlightRuns.size > 0) {
+            await Promise.allSettled([...this.inFlightRuns]);
         }
         if (this.adhocLoopPromise) {
             try { await this.adhocLoopPromise; } catch { /* loop errors already logged */ }

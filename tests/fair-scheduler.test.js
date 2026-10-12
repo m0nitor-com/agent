@@ -96,6 +96,33 @@ describe('FairScheduler', () => {
         expect(peakRetained).toBe(0);
     });
 
+    it('shares one set of slots across concurrent runs without stalling', async () => {
+        const scheduler = new FairScheduler({ total: 2, network: 2, database: 1, diagnostic: 1 });
+        let peak = 0;
+        let active = 0;
+        const work = async (item) => {
+            active++;
+            peak = Math.max(peak, active);
+            await wait(5);
+            active--;
+            return item.id;
+        };
+        const items = (offset) => Array.from({ length: 5 }, (_, i) => ({ id: offset + i, budget: 'network' }));
+
+        // Two callers at once, like the main poll and the on-demand fast lane.
+        const [first, second] = await Promise.all([
+            scheduler.run(items(0), (item) => item.budget, work),
+            scheduler.run(items(100), (item) => item.budget, work),
+        ]);
+
+        expect(first).toEqual([0, 1, 2, 3, 4]);
+        expect(second).toEqual([100, 101, 102, 103, 104]);
+        // Both runs finish, and the shared limit is never exceeded.
+        expect(peak).toBeLessThanOrEqual(2);
+        expect(scheduler.active.total).toBe(0);
+        expect(scheduler.queued).toBe(0);
+    });
+
     it('pauses new work and resumes when unpaused', async () => {
         const scheduler = new FairScheduler({
             total: 1,
