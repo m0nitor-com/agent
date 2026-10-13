@@ -74,7 +74,8 @@ class ApiClient {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
                 'X-Worker-Version': this.version,
-                'X-Agent-Contract-Version': '2',
+                // 3: runs checks at due_at and reports slot_id/scheduled_at/started_at.
+                'X-Agent-Contract-Version': '3',
                 'X-Agent-Capabilities': capabilities.slice(0, 32).join(','),
                 'Authorization': `Bearer ${this.token}`,
             },
@@ -141,13 +142,22 @@ class ApiClient {
             const health = options.health
                 ? Buffer.from(JSON.stringify(options.health)).toString('base64url')
                 : null;
+            // Timed per attempt, so a retry does not skew the clock offset.
+            const sentAt = Date.now();
             const response = Object.keys(options).length > 0
                 ? await this.client.get('/workers/checks', {
                     signal: options.signal,
                     headers: health ? { 'X-Agent-Health': health.slice(0, 6000) } : undefined,
                 })
                 : await this.client.get('/workers/checks');
-            return response.data;
+            const data = response.data;
+            if (data && typeof data === 'object') {
+                Object.defineProperty(data, 'timing', {
+                    value: { sentAt, receivedAt: Date.now() },
+                    enumerable: false,
+                });
+            }
+            return data;
         }, 'getChecks', options);
     }
 

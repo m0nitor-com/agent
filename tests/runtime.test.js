@@ -351,6 +351,113 @@ describe('AgentRuntime', () => {
         await runtime.shutdown('test');
     });
 
+    it('starts a leg with due_at at its due time, not on receipt', async () => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+        try {
+            const started = [];
+            const registry = new CheckRegistry().register('fake', {
+                capability: 'fake',
+                budget: 'network',
+                validate: (raw) => raw,
+                handler: async (monitor) => {
+                    started.push(monitor.id);
+                    return { monitor_id: monitor.id, is_success: true, response_time_ms: 1 };
+                },
+            });
+            const now = Date.now();
+            const response = {
+                server_time: now,
+                monitors: [{ id: 3, type: 'fake', timeout: 5, due_at: now + 2_000, slot_id: 'abc', interval_seconds: 30 }],
+            };
+            Object.defineProperty(response, 'timing', { value: { sentAt: now, receivedAt: now } });
+            const resultQueue = {
+                submitBatch: vi.fn().mockResolvedValue(true),
+                flush: vi.fn().mockResolvedValue(true),
+                dropOldest: vi.fn().mockReturnValue(0),
+                size: 0,
+                telemetry: { size: 0, bytes: 0, counters: {} },
+            };
+            const runtime = new AgentRuntime({
+                config: baseConfig({ REPORT_COALESCE_IDLE_MS: 10 }),
+                logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+                registry,
+                api: { getChecks: vi.fn().mockResolvedValue(response), close: vi.fn() },
+                resultQueue,
+                version: 'test',
+            });
+
+            await runtime.pollOnce();
+            expect(started).toEqual([]);
+            expect(runtime.scheduledInFlight.has('3:')).toBe(true);
+
+            await vi.advanceTimersByTimeAsync(1_999);
+            expect(started).toEqual([]);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(started).toEqual([3]);
+
+            await vi.advanceTimersByTimeAsync(20);
+            await vi.waitFor(() => expect(resultQueue.submitBatch).toHaveBeenCalledTimes(1));
+            expect(resultQueue.submitBatch.mock.calls[0][0][0]).toMatchObject({
+                monitor_id: 3,
+                slot_id: 'abc',
+                scheduled_at: now + 2_000,
+                started_at: now + 2_000,
+            });
+            expect(runtime.healthPayload().schedule.start_delay_ms.p50).toBe(0);
+            await runtime.shutdown('test');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('holds a leg until its report request has finished', async () => {
+        let deliver;
+        const delivered = new Promise((resolve) => { deliver = resolve; });
+        const handler = vi.fn(async (monitor) => ({ monitor_id: monitor.id, is_success: true, response_time_ms: 1 }));
+        const registry = new CheckRegistry().register('fake', {
+            capability: 'fake', budget: 'network', validate: (raw) => raw, handler,
+        });
+        const leg = { id: 4, type: 'fake', timeout: 5, family: 'ipv4' };
+        const resultQueue = {
+            submitBatch: vi.fn(() => delivered),
+            flush: vi.fn().mockResolvedValue(true),
+            dropOldest: vi.fn().mockReturnValue(0),
+            size: 0,
+            telemetry: { size: 0, bytes: 0, counters: {} },
+        };
+        const runtime = new AgentRuntime({
+            config: baseConfig({ REPORT_COALESCE_IDLE_MS: 1 }),
+            logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+            registry,
+            api: { getChecks: vi.fn().mockResolvedValue({ monitors: [leg] }), close: vi.fn() },
+            resultQueue,
+            version: 'test',
+        });
+
+        await runtime.pollOnce();
+        await vi.waitFor(() => expect(resultQueue.submitBatch).toHaveBeenCalledTimes(1));
+        // Result is in, report not yet acknowledged: a poll must not rerun it.
+        await runtime.pollOnce();
+        expect(handler).toHaveBeenCalledTimes(1);
+        expect(runtime.scheduledInFlight.has('4:ipv4')).toBe(true);
+
+        deliver(true);
+        await runtime.idle();
+        await vi.waitFor(() => expect(runtime.scheduledInFlight.size).toBe(0));
+        await runtime.shutdown('test');
+    });
+
+    it('skips a slot that is a full interval late instead of running it', () => {
+        const { runtime } = createRuntime();
+        const leg = { id: 5, type: 'fake', timeout: 5, interval_seconds: 30, due_at: 0 };
+        runtime.scheduledInFlight.add('5:');
+        runtime.clock.offsetMs = 31_000 - Date.now();
+        runtime.startDue([{ dueAt: 0, item: leg }]);
+        expect(runtime.state.skippedSlots).toBe(1);
+        expect(runtime.inFlightRuns.size).toBe(0);
+        expect(runtime.scheduledInFlight.size).toBe(0);
+    });
+
     it('executes registered checks and submits settled results', async () => {
         const { runtime, resultQueue } = createRuntime({
             getChecks: vi.fn().mockResolvedValue({

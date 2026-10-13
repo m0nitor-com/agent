@@ -35,19 +35,33 @@ export class ReportCoalescer {
         this.inFlight = 0;
         this.waiters = [];
         this.pending = [];
+        this.settleCallbacks = [];
         this.closed = false;
         this.defaultSignal = null;
     }
 
+    /**
+     * Buffer a result. options.onSettled runs once its report request has
+     * finished, delivered or handed to the retry queue, so a caller can hold
+     * a check until the console has seen it.
+     */
     push(result, options = {}) {
-        if (this.closed || result == null) return;
+        const onSettled = typeof options.onSettled === 'function' ? options.onSettled : null;
+        if (this.closed || result == null) {
+            onSettled?.();
+            return;
+        }
         if (options.signal) this.defaultSignal = options.signal;
 
         const bytes = serializedBytes(result);
-        if (!Number.isFinite(bytes)) return;
+        if (!Number.isFinite(bytes)) {
+            onSettled?.();
+            return;
+        }
 
         this.buffer.push(result);
         this.bufferBytes += bytes;
+        if (onSettled) this.settleCallbacks.push(onSettled);
         this.armIdleTimer();
 
         if (this.buffer.length >= this.maxCount || this.bufferBytes >= this.maxBytes) {
@@ -55,8 +69,14 @@ export class ReportCoalescer {
         }
     }
 
+    /**
+     * Max-wait, not debounce: the first buffered result starts the timer and
+     * later ones do not push it back. Checks that settle steadily (scheduled
+     * runs spread over the interval) then share one request per window
+     * instead of each sending its own.
+     */
     armIdleTimer() {
-        if (this.idleTimer) clearTimeout(this.idleTimer);
+        if (this.idleTimer) return;
         this.idleTimer = setTimeout(() => {
             this.idleTimer = null;
             this.scheduleFlush({ signal: this.defaultSignal });
@@ -74,11 +94,19 @@ export class ReportCoalescer {
         if (this.buffer.length === 0) return;
         const batch = this.buffer;
         const batchBytes = this.bufferBytes;
+        const callbacks = this.settleCallbacks;
         this.buffer = [];
         this.bufferBytes = 0;
+        this.settleCallbacks = [];
         this.clearIdleTimer();
 
-        const work = this.runFlush(batch, batchBytes, options);
+        const work = this.runFlush(batch, batchBytes, options)
+            .catch(() => false)
+            .finally(() => {
+                for (const callback of callbacks) {
+                    try { callback(); } catch { /* never break the flush */ }
+                }
+            });
         this.pending.push(work);
         void work.finally(() => {
             const index = this.pending.indexOf(work);
@@ -142,5 +170,15 @@ export class ReportCoalescer {
     stop() {
         this.closed = true;
         this.clearIdleTimer();
+    }
+
+    /** Close and settle anything still buffered (nothing will send it now). */
+    close() {
+        this.stop();
+        const callbacks = this.settleCallbacks;
+        this.settleCallbacks = [];
+        for (const callback of callbacks) {
+            try { callback(); } catch { /* ignore */ }
+        }
     }
 }

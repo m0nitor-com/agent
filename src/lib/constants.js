@@ -57,9 +57,16 @@ export const MAX_REPORT_BATCH_SIZE = 50;
 export const MAX_REPORT_BATCH_BYTES = 512 * 1024;
 
 // --- Report coalescing ---
-export const REPORT_COALESCE_IDLE_MS = 30;
+// Longest a settled result waits for siblings before its report is sent.
+export const REPORT_COALESCE_IDLE_MS = 250;
 export const REPORT_MAX_IN_FLIGHT = 2;
 export const REPORT_HOT_PATH_RETRIES = 0;
+
+// --- Scheduling ---
+// A start this much after the due time counts as late in the health payload.
+export const SCHEDULE_LATE_START_MS = 1000;
+// Start delays kept for the p50/p95/p99 health values.
+export const SCHEDULE_DELAY_WINDOW = 2048;
 
 // --- Resource governor ---
 export const GOVERNOR_TICK_INTERVAL_MS = 1000;

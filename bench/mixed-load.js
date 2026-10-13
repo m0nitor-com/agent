@@ -1,5 +1,7 @@
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import { FairScheduler } from '../src/lib/fair-scheduler.js';
+import { ClockSync } from '../src/lib/clock.js';
+import { DueSchedule, LatencyWindow } from '../src/lib/due-schedule.js';
 import { SKU_PROFILES } from '../src/lib/budgets.js';
 import {
     DEFAULT_CONCURRENCY_LIMIT,
@@ -170,8 +172,69 @@ async function measuredRun(iteration) {
     };
 }
 
-if (!['legacy', 'runtime'].includes(MODE)) {
-    throw new Error('Use --mode=legacy or --mode=runtime');
+/**
+ * Start accuracy: checks with due times spread over a window run through the
+ * local schedule and the shared scheduler. Measures how late each one starts
+ * against its due time.
+ */
+async function scheduleRun() {
+    const windowMs = Number(process.env.BENCH_WINDOW_MS || 5_000);
+    const count = Math.min(CHECKS, Number(process.env.BENCH_SCHEDULED || 2_000));
+    const clock = new ClockSync();
+    const scheduler = new FairScheduler({
+        total: skuBudgets.total,
+        network: skuBudgets.network,
+        database: skuBudgets.database,
+        diagnostic: skuBudgets.diagnostic,
+    });
+    const delays = new LatencyWindow(count);
+    const startedAt = clock.serverNow() + 100;
+    let pending = count;
+    let done;
+    const finished = new Promise((resolve) => { done = resolve; });
+    const schedule = new DueSchedule({
+        clock,
+        onDue: (entries) => {
+            void scheduler.run(
+                entries.map((entry) => entry.item),
+                (item) => BUDGETS[item.type],
+                (item) => {
+                    delays.push(Math.max(0, clock.serverNow() - item.dueAt));
+                    return fakeCheck(item.index);
+                },
+                { onResult: () => { if (--pending === 0) done(); } },
+            );
+        },
+    });
+    // The schedule timer is unref'd (it must not hold an agent open on
+    // shutdown); keep the benchmark process alive while it waits.
+    const keepAlive = setInterval(() => {}, 1_000);
+    for (let index = 0; index < count; index++) {
+        const dueAt = startedAt + Math.floor((index / count) * windowMs);
+        schedule.add(dueAt, { index, dueAt, type: TYPES[typeIndexFor(index)] });
+    }
+    await finished;
+    clearInterval(keepAlive);
+    schedule.stop();
+    return { count, windowMs, ...delays.percentiles() };
+}
+
+if (!['legacy', 'runtime', 'schedule'].includes(MODE)) {
+    throw new Error('Use --mode=legacy, --mode=runtime or --mode=schedule');
+}
+
+if (MODE === 'schedule') {
+    const results = [];
+    for (let iteration = 1; iteration <= RUNS; iteration++) results.push(await scheduleRun());
+    const median = (key) => results.map((run) => run[key]).sort((a, b) => a - b)[Math.floor(results.length / 2)];
+    process.stdout.write(`${JSON.stringify({
+        environment: { node: process.version, platform: process.platform, arch: process.arch },
+        sku: skuBudgets,
+        note: 'Start delay against due time with synthetic setTimeout checks. Real probes add DNS and connect time after the start.',
+        runs: results,
+        median_start_delay_ms: { p50: median('p50'), p95: median('p95'), p99: median('p99') },
+    }, null, 2)}\n`);
+    process.exit(0);
 }
 
 const runs = [];

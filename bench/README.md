@@ -13,6 +13,18 @@ npm run benchmark:legacy
 npm run benchmark
 ```
 
+## Start accuracy
+
+```text
+npm run benchmark:schedule
+BENCH_SCHEDULED=5000 BENCH_WINDOW_MS=10000 npm run benchmark:schedule
+```
+
+Puts checks with due times spread evenly over a window into the local
+schedule and reports how late each one started (p50/p95/p99 in ms). It covers
+timer and scheduler overhead only; a real check adds DNS and connect time
+after its start.
+
 ## Profiles
 
 The default `stress` profile distributes work evenly across network, database,

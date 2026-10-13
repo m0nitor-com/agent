@@ -8,6 +8,8 @@ import { closeHttpCheckAgents, configureHttpCheckAgents } from './lib/http-agent
 import { ReportCoalescer } from './lib/report-coalescer.js';
 import { ResourceGovernor } from './lib/resource-governor.js';
 import { EgressDetector } from './lib/egress-detect.js';
+import { ClockSync } from './lib/clock.js';
+import { DueSchedule, LatencyWindow } from './lib/due-schedule.js';
 import {
     CHECK_WATCHDOG_BUFFER_MS,
     DEFAULT_MONITOR_TIMEOUT_S,
@@ -19,6 +21,8 @@ import {
     MIN_MONITOR_TIMEOUT_S,
     REPORT_COALESCE_IDLE_MS,
     REPORT_MAX_IN_FLIGHT,
+    SCHEDULE_DELAY_WINDOW,
+    SCHEDULE_LATE_START_MS,
     SETTLE_LOG_SAMPLE_RATE,
 } from './lib/constants.js';
 
@@ -73,10 +77,17 @@ export class AgentRuntime {
         // poll (which still carries adhoc work for older consoles) never runs
         // a leg the fast lane already has.
         this.adhocInFlight = new Set();
-        // Scheduled legs (monitor id + family) that are queued or running. A
-        // poll no longer waits for the slowest check, so the next poll can
-        // return a leg that is still in flight here; it is skipped, not run twice.
+        // Scheduled legs (monitor id + family) from receipt until the console
+        // has acknowledged their report: waiting for their due time, running,
+        // or with the report still in flight. A poll that returns such a leg
+        // again skips it instead of running it twice.
         this.scheduledInFlight = new Set();
+        this.clock = new ClockSync();
+        this.dueSchedule = new DueSchedule({
+            clock: this.clock,
+            onDue: (entries) => this.startDue(entries),
+        });
+        this.startDelays = new LatencyWindow(SCHEDULE_DELAY_WINDOW);
         // Detached runs started by pollOnce(); shutdown waits for them.
         this.inFlightRuns = new Set();
         this.isPolling = false;
@@ -93,6 +104,9 @@ export class AgentRuntime {
             validationFailures: 0,
             pollOverlapSkips: 0,
             settleLogCounter: 0,
+            scheduledChecks: 0,
+            lateStarts: 0,
+            skippedSlots: 0,
             active: { total: 0, network: 0, database: 0, diagnostic: 0 },
             queueDepth: 0,
             latestAvailableVersion: null,
@@ -226,6 +240,15 @@ export class AgentRuntime {
     }
 
     async executeCheck(monitor) {
+        const result = await this.runHandler(monitor);
+        // Slot fields let the console drop a duplicate and measure start delay.
+        if (monitor.slot_id) result.slot_id = monitor.slot_id;
+        if (Number.isFinite(monitor.due_at)) result.scheduled_at = monitor.due_at;
+        if (Number.isFinite(monitor.startedAt)) result.started_at = monitor.startedAt;
+        return result;
+    }
+
+    async runHandler(monitor) {
         const entry = this.registry.get(monitor.type);
         if (!entry) {
             return {
@@ -283,6 +306,9 @@ export class AgentRuntime {
             });
             this.state.consecutiveFailedPolls = 0;
             this.state.lastSuccessfulPollAt = new Date();
+            if (data?.timing) {
+                this.clock.observe(Number(data.server_time), data.timing.sentAt, data.timing.receivedAt);
+            }
 
             this.applyRemoteBudgets(data.worker?.budgets);
 
@@ -304,14 +330,18 @@ export class AgentRuntime {
                 location: data.location?.code,
             }, '[POLL] Received checks');
 
-            // Detached: the poll returns as soon as the work is queued. A slow
-            // check no longer holds back the next poll, so every other monitor
-            // keeps its interval. Shutdown waits for these runs.
-            const run = this.runMonitors(monitors).catch((error) => {
-                this.logger.warn(safeError(error), '[POLL] Run failed');
-            });
-            this.inFlightRuns.add(run);
-            void run.finally(() => this.inFlightRuns.delete(run));
+            // Legs with a due time wait in the local schedule and start on
+            // time. Legs without one (older console, on-demand work) run now.
+            const now = [];
+            for (const monitor of monitors) {
+                if (monitor.id > 0 && Number.isFinite(monitor.due_at)) {
+                    this.scheduledInFlight.add(AgentRuntime.legKey(monitor));
+                    this.dueSchedule.add(monitor.due_at, monitor);
+                } else {
+                    now.push(monitor);
+                }
+            }
+            if (now.length > 0) this.launch(now);
             return data.poll_after_ms || null;
         } catch (error) {
             if (this.isShuttingDown || this.shutdownController.signal.aborted) return null;
@@ -361,34 +391,86 @@ export class AgentRuntime {
         return monitors;
     }
 
-    async runMonitors(monitors) {
+    /** Run detached; a slow check never holds back a poll. Shutdown waits. */
+    launch(monitors, { flush = true } = {}) {
+        const run = this.runMonitors(monitors, { flush }).catch((error) => {
+            this.logger.warn(safeError(error), '[POLL] Run failed');
+        });
+        this.inFlightRuns.add(run);
+        void run.finally(() => this.inFlightRuns.delete(run));
+        return run;
+    }
+
+    /** Timer callback of the local schedule: start every leg now due. */
+    startDue(entries) {
+        if (this.isShuttingDown) return;
+        const serverNow = this.clock.serverNow();
+        const monitors = [];
+        for (const { dueAt, item } of entries) {
+            const lateBy = serverNow - dueAt;
+            // A leg so late that its next slot has begun is skipped, not run
+            // twice in a row; the console hands out the current slot instead.
+            const intervalMs = Number(item.interval_seconds) * 1000;
+            if (intervalMs > 0 && lateBy >= intervalMs) {
+                this.state.skippedSlots++;
+                this.scheduledInFlight.delete(AgentRuntime.legKey(item));
+                continue;
+            }
+            monitors.push(item);
+        }
+        // No forced flush: runs start spread over the interval, and the
+        // coalescing window gathers their results into shared requests.
+        if (monitors.length > 0) this.launch(monitors, { flush: false });
+    }
+
+    async runMonitors(monitors, { flush = true } = {}) {
         const adhocIds = monitors.filter((m) => m.id < 0).map((m) => m.id);
         adhocIds.forEach((id) => this.adhocInFlight.add(id));
         const legKeys = monitors.filter((m) => m.id > 0).map((m) => AgentRuntime.legKey(m));
         legKeys.forEach((key) => this.scheduledInFlight.add(key));
+        const held = new Set(legKeys);
+        const release = (monitor) => {
+            const key = AgentRuntime.legKey(monitor);
+            if (held.delete(key)) this.scheduledInFlight.delete(key);
+        };
         try {
             await this.scheduler.run(
                 monitors,
                 (monitor) => this.registry.budgetFor(monitor.type),
-                (monitor) => this.executeCheck(monitor),
+                (monitor) => {
+                    // Measured when the check really starts, after any queueing.
+                    monitor.startedAt = Math.round(this.clock.serverNow());
+                    if (monitor.id > 0 && Number.isFinite(monitor.due_at)) {
+                        const delay = monitor.startedAt - monitor.due_at;
+                        this.state.scheduledChecks++;
+                        this.startDelays.push(Math.max(0, delay));
+                        if (delay > SCHEDULE_LATE_START_MS) this.state.lateStarts++;
+                    }
+                    return this.executeCheck(monitor);
+                },
                 {
                     onResult: (result, index) => {
                         const settled = monitors[index];
-                        if (settled?.id > 0) this.scheduledInFlight.delete(AgentRuntime.legKey(settled));
                         this.state.totalChecks++;
                         if (!result?.is_success) this.state.checkFailures++;
                         this.logSettled(result);
-                        this.coalescer.push(result, { signal: this.shutdownController.signal });
+                        // The leg stays occupied until its report request has
+                        // finished, so no poll in between can fetch it again.
+                        this.coalescer.push(result, {
+                            signal: this.shutdownController.signal,
+                            onSettled: settled?.id > 0 ? () => release(settled) : undefined,
+                        });
                         // Someone is watching an on-demand leg live: send now,
                         // not after the coalescing window.
                         if (result?.monitor_id < 0) this.coalescer.scheduleFlush({ signal: this.shutdownController.signal });
                     },
                 },
             );
-            await this.coalescer.flush({ signal: this.shutdownController.signal });
+            if (flush) await this.coalescer.flush({ signal: this.shutdownController.signal });
         } finally {
+            // Normally each leg is released when its report request finishes.
             // A run that ends early (shutdown) must not leave legs locked.
-            legKeys.forEach((key) => this.scheduledInFlight.delete(key));
+            if (this.isShuttingDown) held.forEach((key) => this.scheduledInFlight.delete(key));
             // Held a little past completion: a main poll fetched before the
             // report landed may still carry the id.
             const release = setTimeout(() => adhocIds.forEach((id) => this.adhocInFlight.delete(id)), 30_000);
@@ -471,7 +553,16 @@ export class AgentRuntime {
         return {
             status: healthy ? 'ok' : 'unhealthy',
             version: this.version,
-            contract_version: 2,
+            contract_version: 3,
+            schedule: {
+                pending: this.dueSchedule.size,
+                held_legs: this.scheduledInFlight.size,
+                started: this.state.scheduledChecks,
+                late_starts: this.state.lateStarts,
+                skipped_slots: this.state.skippedSlots,
+                start_delay_ms: this.startDelays.percentiles(),
+                clock: this.clock.telemetry,
+            },
             uptime_seconds: Math.floor(process.uptime()),
             shutting_down: this.isShuttingDown,
             active_checks: { ...this.state.active },
@@ -580,6 +671,11 @@ export class AgentRuntime {
         this.isShuttingDown = true;
         this.logger.info({ reason }, '[AGENT] Graceful shutdown started');
         this.shutdownController.abort(new Error(`Agent shutdown: ${reason}`));
+        // Legs not started yet are simply not run; the console lease expires
+        // and another probe or the next start picks them up.
+        for (const { item } of this.dueSchedule.stop()) {
+            this.scheduledInFlight.delete(AgentRuntime.legKey(item));
+        }
 
         if (this.governorTimer) {
             clearInterval(this.governorTimer);
@@ -601,6 +697,7 @@ export class AgentRuntime {
             try { await this.adhocLoopPromise; } catch { /* loop errors already logged */ }
         }
         await this.coalescer.flush({ signal: AbortSignal.timeout?.(this.config.SHUTDOWN_FLUSH_TIMEOUT) });
+        this.coalescer.close();
         const flushed = await this.resultQueue.flush(this.config.SHUTDOWN_FLUSH_TIMEOUT);
         closeHttpCheckAgents();
         this.api.close();

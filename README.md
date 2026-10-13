@@ -8,6 +8,7 @@ This is the distributed worker agent for [m0nitor.com](https://m0nitor.com). It 
 - **Dual-Stack**: IPv4 and IPv6 targets, with an optional per-check or global address-family preference.
 - **Egress discovery**: Periodically learns the probe's public IPv4 and IPv6 (for the console allowlist at `/ips.json`).
 - **Secure**: Uses token-based authentication with the m0nitor API.
+- **On-time scheduling**: Starts each check at the time the console assigned to it, independent of when the poll happened. See [Scheduling](#scheduling).
 - **Resource-aware**: Detects cgroup CPU/memory (with host fallback), selects SKU budgets, micro-batches reports, and governs concurrency from RSS / event-loop lag.
 - **Containerized**: Ready for Docker and Kubernetes deployments.
 
@@ -165,12 +166,43 @@ trips.
 > - Only set `SKIP_SSL_VERIFY=true` in development environments with self-signed certificates. Never use this in production as it allows man-in-the-middle attacks.
 > - `ALLOW_PRIVATE_TARGETS=true` disables SSRF egress protection globally. Use only on isolated worker instances where every operator is trusted to define monitor targets.
 
+## Scheduling
+
+The console gives every check a fixed due time. Checks with the same interval
+are spread across it, so they do not all start in the same second.
+
+- **Lookahead**: a poll returns checks due within the next few seconds, each
+  with `due_at` (epoch ms, console clock) and a `slot_id`. The agent keeps them
+  in a local schedule and starts each one at its due time. One timer is armed
+  for the next due time; there is no busy loop. A missed poll therefore does
+  not cost a run.
+- **Clock offset**: every poll response carries `server_time`. The agent
+  compares it with the midpoint of the request and keeps a smoothed offset, so
+  checks start on console time even when the host clock is off. NTP on the
+  host is recommended but not required.
+- **No double runs**: a check stays occupied from receipt until the console
+  has answered its report, not just until the result exists. The console also
+  hands out each check to one poll only, and drops a second report for the
+  same slot.
+- **Reports**: each result carries `slot_id`, `scheduled_at` and
+  `started_at`, so the console can measure how late a check started.
+- **Falling behind**: a check that is a full interval late when its timer
+  fires is skipped rather than run back to back with the next one.
+- **Older consoles**: without `due_at` the agent runs checks as soon as they
+  arrive, as before.
+
+The agent announces this with `X-Agent-Contract-Version: 3`. Its health
+payload has a `schedule` block: pending and held checks, start delay
+p50/p95/p99 in ms, late starts, skipped slots and the clock offset.
+
 ## Performance verification
 
 Run `npm run benchmark` for the fair, budgeted runtime and
 `npm run benchmark:legacy` for the fixed-chunk comparison. Set
 `BENCH_PROFILE=typical` for the representative mix and `BENCH_SKU=sku-2c2g`
-(or `sku-1c1g` / `sku-2c4g`) to pin concurrency. The harness uses synthetic
+(or `sku-1c1g` / `sku-2c4g`) to pin concurrency. `npm run benchmark:schedule`
+measures start delay against the due time for checks spread over a window
+(`BENCH_SCHEDULED`, `BENCH_WINDOW_MS`). The harness uses synthetic
 timers only - see `bench/README.md` for honesty notes and optional Docker
 `--cpus` / `--memory` smoke commands.
 
