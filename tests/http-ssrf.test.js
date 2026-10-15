@@ -14,7 +14,7 @@ vi.mock('axios', () => ({ default: mockAxios }));
 
 const { checkHttp } = await import('../src/checks/http.js');
 
-describe('checkHttp — SSRF mitigation', () => {
+describe('checkHttp - SSRF mitigation', () => {
     beforeEach(() => {
         vi.clearAllMocks();
     });

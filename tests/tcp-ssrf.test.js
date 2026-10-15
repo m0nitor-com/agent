@@ -40,7 +40,7 @@ vi.mock('net', () => ({
 
 const { checkTcp } = await import('../src/checks/tcp.js');
 
-describe('checkTcp — SSRF mitigation', () => {
+describe('checkTcp - SSRF mitigation', () => {
     beforeEach(() => {
         vi.clearAllMocks();
     });

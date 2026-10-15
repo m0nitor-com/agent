@@ -59,7 +59,7 @@ describe('computeNextPollDelay', () => {
         expect(result).toBeLessThanOrEqual(300_000);
     });
 
-    it('edge case: maxInterval === baseInterval — returns floor(rng() * base)', () => {
+    it('edge case: maxInterval === baseInterval - returns floor(rng() * base)', () => {
         const result = computeNextPollDelay(5000, 5000, 10, () => 0.5);
         expect(result).toBe(2500);
     });
