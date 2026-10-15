@@ -9,8 +9,12 @@ function clamp(value, min, max) {
 }
 
 /**
- * Resource governor: event-loop p99 and RSS soft pressure reduce effective
- * concurrency stepwise; RSS hard pauses the scheduler and signals saturation.
+ * Resource governor. RSS soft pressure reduces effective concurrency
+ * stepwise, and only while nothing is waiting. A queued check means the
+ * slots are already the scarce resource, so they are restored in full.
+ * Event-loop delay is reported, not used to cut slots: one slow stretch
+ * used to pin p99 for the life of the process and leave a location on a
+ * single slot. RSS hard pauses the scheduler.
  */
 export class ResourceGovernor {
     constructor({
@@ -87,6 +91,7 @@ export class ResourceGovernor {
             effective: this.currentLimits(),
             base: { ...this.baseLimits },
             last_action: this.lastAction,
+            event_loop_p99_ms: Number(this.getEventLoopP99Ms?.() || 0),
         };
     }
 
@@ -171,8 +176,12 @@ export class ResourceGovernor {
         this.applyLimits(reason);
     }
 
-    tick() {
-        const p99 = Number(this.getEventLoopP99Ms?.() || 0);
+    /**
+     * @param {{ queued?: number }} [snapshot] queued is work that is due and
+     *   has no slot yet. Scheduled-but-not-yet-due legs are not a backlog.
+     */
+    tick(snapshot = {}) {
+        const queued = Math.max(0, Number(snapshot.queued) || 0);
         const rss = Number(this.getRssBytes?.() || 0);
 
         if (rss >= this.hardRssBytes) {
@@ -181,15 +190,30 @@ export class ResourceGovernor {
             return this.telemetry();
         }
 
-        const softPressure = rss >= this.softRssBytes || p99 >= this.softEventLoopMs;
-        const hardLag = p99 >= this.hardEventLoopMs;
+        if (queued > 0) {
+            this.pressureTicks = 0;
+            this.stableTicks = 0;
+            if (this.reductionSteps > 0 || this.paused) {
+                this.reductionSteps = 0;
+                this.paused = false;
+                this.saturated = false;
+                this.effective = { ...this.baseLimits };
+                this.lastAction = 'backlog';
+                this.onRestore?.('backlog');
+                this.applyLimits('backlog');
+            } else {
+                this.saturated = false;
+            }
+            return this.telemetry();
+        }
 
-        if (softPressure || hardLag) {
+        const softPressure = rss >= this.softRssBytes;
+
+        if (softPressure) {
             this.pressureTicks++;
             this.stableTicks = 0;
-            // Reduce on first pressure tick, then every 3rd tick; hard lag always reduces.
-            if (hardLag || this.pressureTicks === 1 || this.pressureTicks % 3 === 0) {
-                this.reduce(hardLag ? 'event_loop_hard' : (rss >= this.softRssBytes ? 'rss_soft' : 'event_loop_soft'));
+            if (this.pressureTicks === 1 || this.pressureTicks % 3 === 0) {
+                this.reduce('rss_soft');
             }
             return this.telemetry();
         }

@@ -14,6 +14,7 @@ import {
     CHECK_WATCHDOG_BUFFER_MS,
     DEFAULT_MONITOR_TIMEOUT_S,
     EVENT_LOOP_DELAY_RESOLUTION_MS,
+    EVENT_LOOP_WINDOW_MS,
     GOVERNOR_TICK_INTERVAL_MS,
     HEALTH_RESPONSE_MAX_BYTES,
     HEALTH_UNHEALTHY_AFTER_FAILED_POLLS,
@@ -592,6 +593,19 @@ export class AgentRuntime {
                 validation_failures: this.state.validationFailures,
                 poll_overlap_skips: this.state.pollOverlapSkips,
             },
+            budgets: {
+                cpus: this.budgets?.detected?.cpus ?? null,
+                memory_bytes: this.budgets?.detected?.memoryBytes ?? null,
+                total: governor.base?.total ?? null,
+                network: governor.base?.network ?? null,
+                database: governor.base?.database ?? null,
+                diagnostic: governor.base?.diagnostic ?? null,
+                sockets: this.config.HTTP_MAX_SOCKETS ?? null,
+                soft_rss_bytes: governor.soft_rss_bytes ?? null,
+                hard_rss_bytes: governor.hard_rss_bytes ?? null,
+                effective_total: governor.effective?.total ?? null,
+                reduction_steps: governor.reduction_steps ?? 0,
+            },
             egress: this.egress.snapshot(),
         };
     }
@@ -623,9 +637,15 @@ export class AgentRuntime {
 
     startGovernor() {
         if (this.governorTimer) return;
+        this.eventLoopWindowStarted = Date.now();
         this.governorTimer = setInterval(() => {
             if (this.isShuttingDown) return;
-            this.governor.tick();
+            this.governor.tick({ queued: this.state.queueDepth });
+            const now = Date.now();
+            if (now - this.eventLoopWindowStarted >= EVENT_LOOP_WINDOW_MS) {
+                this.eventLoopDelay.reset();
+                this.eventLoopWindowStarted = now;
+            }
         }, GOVERNOR_TICK_INTERVAL_MS);
         this.governorTimer.unref?.();
     }

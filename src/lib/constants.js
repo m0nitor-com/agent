@@ -73,6 +73,9 @@ export const GOVERNOR_TICK_INTERVAL_MS = 1000;
 export const GOVERNOR_EVENT_LOOP_P99_SOFT_MS = 50;
 export const GOVERNOR_EVENT_LOOP_P99_HARD_MS = 150;
 export const GOVERNOR_RESTORE_STABLE_TICKS = 5;
+// The delay histogram is cumulative. Reset it so the reported p99 is the last
+// window, not the worst moment since process start.
+export const EVENT_LOOP_WINDOW_MS = 15_000;
 export const GOVERNOR_SOFT_RSS_BYTES = 350 * 1024 * 1024;
 export const GOVERNOR_HARD_RSS_BYTES = 550 * 1024 * 1024;
 export const SETTLE_LOG_SAMPLE_RATE = 50;

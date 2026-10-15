@@ -474,4 +474,27 @@ describe('AgentRuntime', () => {
         expect(runtime.state.totalChecks).toBe(1);
         await runtime.shutdown('test');
     });
+
+    it('echoes the resolved budget in health', async () => {
+        const { runtime } = createRuntime();
+        runtime.budgets = {
+            detected: { cpus: 4, memoryBytes: 8 * 1024 * 1024 * 1024, memoryGiB: 8, source: 'cgroup' },
+        };
+
+        expect(runtime.healthPayload().budgets).toMatchObject({
+            cpus: 4,
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            total: 2,
+            network: 2,
+            database: 1,
+            diagnostic: 1,
+            sockets: 6,
+            soft_rss_bytes: 350 * 1024 * 1024,
+            hard_rss_bytes: 550 * 1024 * 1024,
+            effective_total: 2,
+            reduction_steps: 0,
+        });
+
+        await runtime.shutdown('test');
+    });
 });

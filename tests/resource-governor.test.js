@@ -63,4 +63,40 @@ describe('ResourceGovernor', () => {
         expect(governor.effective.total).toBe(16);
         expect(governor.paused).toBe(false);
     });
+
+    it('does not cut slots because the event loop was slow', () => {
+        const governor = new ResourceGovernor({
+            baseLimits: { total: 48, network: 46, database: 2, diagnostic: 1 },
+            softRssBytes: 350 * 1024 * 1024,
+            hardRssBytes: 550 * 1024 * 1024,
+            getEventLoopP99Ms: () => 800,
+            getRssBytes: () => 100 * 1024 * 1024,
+            restoreStableTicks: 100,
+        });
+
+        for (let i = 0; i < 40; i++) governor.tick();
+        expect(governor.effective.total).toBe(48);
+        expect(governor.reductionSteps).toBe(0);
+    });
+
+    it('restores the full ceiling as soon as checks are waiting', () => {
+        const governor = new ResourceGovernor({
+            baseLimits: { total: 48, network: 46, database: 2, diagnostic: 1 },
+            softRssBytes: 350 * 1024 * 1024,
+            hardRssBytes: 550 * 1024 * 1024,
+            getEventLoopP99Ms: () => 1,
+            getRssBytes: () => 400 * 1024 * 1024,
+            restoreStableTicks: 100,
+        });
+
+        governor.tick();
+        governor.tick();
+        governor.tick();
+        expect(governor.effective.total).toBeLessThan(48);
+
+        governor.tick({ queued: 100 });
+        expect(governor.effective.total).toBe(48);
+        expect(governor.reductionSteps).toBe(0);
+        expect(governor.paused).toBe(false);
+    });
 });
