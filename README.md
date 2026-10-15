@@ -9,7 +9,7 @@ This is the distributed worker agent for [m0nitor.com](https://m0nitor.com). It 
 - **Egress discovery**: Periodically learns the probe's public IPv4 and IPv6 (for the console allowlist at `/ips.json`).
 - **Secure**: Uses token-based authentication with the m0nitor API.
 - **On-time scheduling**: Starts each check at the time the console assigned to it, independent of when the poll happened. See [Scheduling](#scheduling).
-- **Resource-aware**: Detects cgroup CPU/memory (with host fallback), selects SKU budgets, micro-batches reports, and governs concurrency from RSS / event-loop lag.
+- **Resource-aware**: Detects cgroup CPU/memory (with host fallback), selects SKU budgets, micro-batches reports, and governs concurrency from RSS pressure. Event-loop lag is reported, not used to cut slots.
 - **Containerized**: Ready for Docker and Kubernetes deployments.
 
 ## Quick Start
@@ -122,7 +122,7 @@ All configuration is done via environment variables.
 | `DATABASE_CONCURRENCY` | Concurrent database connections. No pools are retained. | SKU / formula |
 | `DIAGNOSTIC_CONCURRENCY` | Concurrent MTR or traceroute processes. | SKU / formula |
 | `HTTP_MAX_SOCKETS` | Max sockets per shared HTTP check agent (coupled to network budget). | SKU / formula |
-| `HTTP_MAX_FREE_SOCKETS` | Max free sockets retained per shared HTTP check agent. | SKU / formula |
+| `HTTP_MAX_FREE_SOCKETS` | Idle sockets retained per shared HTTP check agent. HTTP checks do not use keep-alive, so this is `0` unless you raise it for a trusted setup. | `0` |
 | `RESULT_QUEUE_MAX_ENTRIES` | Maximum retry queue entries. Oldest results are dropped with telemetry when full. | SKU / formula |
 | `RESULT_QUEUE_MAX_BYTES` | Maximum serialized retry queue size. | SKU / formula |
 | `REPORT_BATCH_MAX_SIZE` | Maximum results per micro-batched report request. | SKU / formula |
@@ -148,14 +148,27 @@ Named SKUs stay available only when `AGENT_SKU` pins one.
 | 4 cores | 192 | 186 | 186 |
 
 Soft RSS is 55% of detected memory and hard RSS is 80%. Past the soft line the
-governor steps concurrency down. Past the hard line it pauses.
+governor steps concurrency down, but only while no check is waiting for a slot.
+As soon as due checks queue up, the full ceiling is restored, because slots are
+then the scarce resource. Past the hard line the governor pauses.
+
+Event-loop delay is measured over a 15 second window and reported in the health
+payload (`event_loop`). It does not reduce concurrency: a single slow stretch
+used to pin the cumulative p99 for the life of the process and leave a probe on
+one slot.
+
+HTTP checks open a fresh connection and keep no idle sockets. Node counts free
+sockets per host, so retaining them would hold a TLS session for every target
+ever checked, grow RSS over time, and make measured response times depend on
+whether the pool still had a warm connection to that host.
 
 ENV overrides still work, then are normalized so network/db/diag and HTTP sockets
 stay within the total budget.
 
 Startup logs include the detected resources and chosen budgets. Health payloads
-expose governor state, coalescer telemetry, and `saturated` when hard pressure
-trips.
+expose governor state, the resolved `budgets` (CPUs, memory, slot ceilings,
+socket count, RSS limits, effective total), coalescer telemetry, and `saturated`
+when hard pressure trips.
 
 > Response headers are parsed up to 64 KB (`--max-http-header-size`, set in
 > the start script and in the image). Node's 16 KB default rejects real-world
