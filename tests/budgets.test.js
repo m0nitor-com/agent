@@ -27,6 +27,7 @@ describe('budgets', () => {
         expect(one.total).toBe(48);
         expect(one.network).toBe(46);
         expect(one.httpMaxSockets).toBe(46);
+        expect(one.httpMaxFreeSockets).toBe(0);
 
         const pinned = computeBudgets({
             cpus: 1,
@@ -38,9 +39,18 @@ describe('budgets', () => {
         expect(pinned).toMatchObject(SKU_PROFILES['sku-1c1g']);
     });
 
+    it('keeps a burst ceiling and does not retain an idle socket per host', () => {
+        const wide = computeFullBudgets(8, 32, 32 * 1024 ** 3);
+        expect(wide.total).toBe(256);
+        expect(wide.httpMaxSockets).toBe(wide.network);
+        expect(wide.httpMaxFreeSockets).toBe(0);
+        expect(wide.hardRssBytes).toBeGreaterThan(wide.softRssBytes);
+    });
+
     it('scales the full profile with the console coefficients', () => {
         const doubled = computeFullBudgets(2, 4, 4 * 1024 ** 3, {
             total_per_cpu: 48,
+            max_total: 128,
             socket_ratio: 1,
         });
         expect(doubled.total).toBe(96);

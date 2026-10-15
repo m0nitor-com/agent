@@ -17,9 +17,14 @@ const agents = new Map();
  */
 export function configureHttpCheckAgents(options = {}) {
     const maxSockets = Math.max(1, Number(options.maxSockets) || DEFAULT_HTTP_MAX_SOCKETS);
+    const requestedFree = Number(options.maxFreeSockets);
+    // 0 is a real setting: keep no idle socket. `||` would turn it into the default.
     const maxFreeSockets = Math.max(
-        1,
-        Math.min(maxSockets, Number(options.maxFreeSockets) || DEFAULT_HTTP_MAX_FREE_SOCKETS),
+        0,
+        Math.min(
+            maxSockets,
+            Number.isFinite(requestedFree) ? requestedFree : DEFAULT_HTTP_MAX_FREE_SOCKETS,
+        ),
     );
     poolOptions = { maxSockets, maxFreeSockets };
     closeHttpCheckAgents();
@@ -33,12 +38,15 @@ export function sharedHttpCheckAgent(protocol, allowPrivate, verifyTls) {
     const key = `${protocol}:${allowPrivate ? 'private' : 'public'}:${verifyTls ? 'verify' : 'insecure'}`;
     if (agents.has(key)) return agents.get(key);
 
-    const { maxSockets, maxFreeSockets } = poolOptions;
+    const { maxSockets } = poolOptions;
+    // keepAlive is off on purpose. Node counts maxFreeSockets per host and
+    // treats 0 as 256, so a positive free-socket budget keeps a TLS session
+    // for every target. That is the RSS climb, and warm sockets make the
+    // measured response time depend on whether the pool still held the host.
+    // maxSockets still caps how many checks can be in flight together.
     const common = {
-        keepAlive: true,
-        keepAliveMsecs: 1000,
+        keepAlive: false,
         maxSockets,
-        maxFreeSockets,
         maxTotalSockets: maxSockets,
         scheduling: 'lifo',
         timeout: 30_000,

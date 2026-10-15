@@ -8,8 +8,11 @@ function clamp(value, min, max) {
 
 /**
  * Pulled from the console on each poll (worker.budgets). Checks wait on the
- * network, so one core can hold many of them. The governor still steps down
- * when RSS or the event loop actually gets tight.
+ * network, so one core can hold many of them. The ceiling has to cover a
+ * whole location becoming due at once (a probe that was offline). Steady
+ * state only uses a handful of those slots. Idle TLS sockets are not kept:
+ * one warm connection per target was the RSS growth, and it made response
+ * times depend on whether the pool still held that host.
  */
 export const FULL_BUDGET_DEFAULTS = Object.freeze({
     totalPerCpu: 48,
@@ -155,7 +158,9 @@ export function computeFullBudgets(cpus, memoryGiB, memoryBytes, profile = {}) {
     const diagnostic = safeMemGiB >= 2 ? 2 : 1;
     const network = Math.max(4, total - database - diagnostic);
     const httpMaxSockets = clamp(Math.ceil(network * socketRatio), 8, network);
-    const httpMaxFreeSockets = clamp(Math.ceil(httpMaxSockets / 4), 2, 16);
+    // 0: Node's maxFreeSockets is per host. Any positive value keeps one TLS
+    // session for every target the probe has ever checked.
+    const httpMaxFreeSockets = 0;
     const bytes = memoryBytes > 0 ? memoryBytes : Math.round(safeMemGiB * GiB);
 
     return {
@@ -168,7 +173,7 @@ export function computeFullBudgets(cpus, memoryGiB, memoryBytes, profile = {}) {
         httpMaxSockets,
         httpMaxFreeSockets,
         queueEntries: clamp(round(safeMemGiB * 500), 500, 4000),
-        queueBytes: clamp(round(safeMemGiB * 8) * MiB, 8 * MiB, 32 * MiB),
+        queueBytes: clamp(round(safeMemGiB * 4) * MiB, 4 * MiB, 32 * MiB),
         batchSize: 100,
         batchBytes: 1 * MiB,
         softRssBytes: Math.round(bytes * FULL_BUDGET_DEFAULTS.softRssRatio),
@@ -189,10 +194,11 @@ export function normalizeBudgets(input) {
         4,
         Math.min(512, Math.max(4, network)),
     );
+    const requestedFree = Number(input.httpMaxFreeSockets);
     const httpMaxFreeSockets = clamp(
-        round(Number(input.httpMaxFreeSockets) || Math.ceil(httpMaxSockets / 4)),
-        1,
-        Math.min(16, httpMaxSockets),
+        round(Number.isFinite(requestedFree) ? requestedFree : Math.ceil(httpMaxSockets / 4)),
+        0,
+        Math.min(256, httpMaxSockets),
     );
 
     return {
