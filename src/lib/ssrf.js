@@ -39,13 +39,21 @@ const BLOCKED_IPV6_RANGES = new Set([
 // is matched explicitly. It is reserved and must never be a real monitor target.
 const DOCUMENTATION_IPV6 = ipaddr.parseCIDR('2001:db8::/32');
 
+function abortError(signal) {
+    return signal?.reason || Object.assign(new Error('DNS resolution aborted'), { code: 'ABORT_ERR' });
+}
+
+/**
+ * DNS for the HTTP SSRF preflight. Uses the process resolver instead of a
+ * new c-ares channel per lookup. A private Resolver per check is what piled
+ * native memory up over a long run, and cancel() on a shared channel would
+ * abort every other in-flight lookup. The check's own timeout still wins:
+ * once the signal fires, the result is discarded.
+ */
 async function resolveWithCancellableResolver(host, family, signal) {
-    const resolver = new dns.Resolver();
-    const cancel = () => resolver.cancel();
     if (signal?.aborted) {
-        return { error: signal.reason || new Error('DNS resolution aborted') };
+        return { error: abortError(signal) };
     }
-    signal?.addEventListener('abort', cancel, { once: true });
 
     const normalize = (addresses, addressFamily) => addresses.map((address) => ({
         address,
@@ -56,23 +64,41 @@ async function resolveWithCancellableResolver(host, family, signal) {
         throw error;
     };
 
-    try {
+    const query = (async () => {
         if (family === 4) {
-            return { addresses: normalize(await resolver.resolve4(host), 4) };
+            return { addresses: normalize(await dns.resolve4(host), 4) };
         }
         if (family === 6) {
-            return { addresses: normalize(await resolver.resolve6(host), 6) };
+            return { addresses: normalize(await dns.resolve6(host), 6) };
         }
 
         const [ipv4, ipv6] = await Promise.all([
-            resolver.resolve4(host).catch(swallowNoData),
-            resolver.resolve6(host).catch(swallowNoData),
+            dns.resolve4(host).catch(swallowNoData),
+            dns.resolve6(host).catch(swallowNoData),
         ]);
         return { addresses: [...normalize(ipv4, 4), ...normalize(ipv6, 6)] };
+    })();
+
+    if (!signal) {
+        try {
+            return await query;
+        } catch (error) {
+            return { error };
+        }
+    }
+
+    let onAbort;
+    const aborted = new Promise((_, reject) => {
+        onAbort = () => reject(abortError(signal));
+        signal.addEventListener('abort', onAbort, { once: true });
+    });
+
+    try {
+        return await Promise.race([query, aborted]);
     } catch (error) {
         return { error };
     } finally {
-        signal?.removeEventListener('abort', cancel);
+        signal.removeEventListener('abort', onAbort);
     }
 }
 
