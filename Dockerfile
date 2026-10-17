@@ -1,6 +1,6 @@
 # Node 24 Alpine via the public ECR mirror. Docker Hub anonymous pulls were
 # rate-limited and timing out on the publish workflow.
-FROM public.ecr.aws/docker/library/node:24-alpine
+FROM public.ecr.aws/docker/library/node:26-alpine
 
 # Set working directory
 WORKDIR /app
