@@ -1,10 +1,16 @@
 import { spawn } from 'node:child_process';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import { config as appConfig } from '../lib/config.js';
 import { resolveAndCheck, effectiveFamily, familyLabel } from '../lib/ssrf.js';
 
 const MAX_DIAGNOSTIC_OUTPUT_BYTES = 256 * 1024;
 const MAX_DIAGNOSTIC_HOPS = 64;
 const MAX_DIAGNOSTIC_CYCLES = 10;
+const MAX_HOSTNAME_LENGTH = 253;
+const REVERSE_DNS_BUDGET_MS = 2000;
+const REVERSE_DNS_DEADLINE_MARGIN_MS = 500;
+const HOSTNAME_PATTERN = /^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*$/;
 
 function boundedInteger(value, fallback, minimum, maximum) {
     const number = Number(value);
@@ -136,6 +142,68 @@ export function parseTracerouteOutput(output) {
     return hops;
 }
 
+/**
+ * A PTR answer is whatever the owner of the address block put there, so only
+ * a plain DNS name is kept. An answer that merely repeats the address adds
+ * nothing to the hop row.
+ */
+export function normalizeHostname(name, ip) {
+    if (typeof name !== 'string') return null;
+    const hostname = name.trim().replace(/\.$/, '').toLowerCase();
+    if (hostname === '' || hostname.length > MAX_HOSTNAME_LENGTH) return null;
+    if (hostname === String(ip).toLowerCase()) return null;
+    return HOSTNAME_PATTERN.test(hostname) ? hostname : null;
+}
+
+/**
+ * Reverse-resolve every answering hop the way mtr does without --no-dns, but
+ * after the trace and in parallel, so slow PTR zones cost a bounded budget
+ * instead of stretching the trace itself. The tools keep running numerically:
+ * host stays the address, because route signatures and the reached check
+ * compare addresses. Lookups go through the process resolver like the SSRF
+ * preflight; a lookup that misses the budget is ignored, not cancelled.
+ */
+export async function resolveHopHostnames(hops, {
+    budgetMs = REVERSE_DNS_BUDGET_MS,
+    signal = null,
+    reverse = dns.reverse,
+} = {}) {
+    const addresses = [...new Set(hops
+        .map((hop) => hop.host)
+        .filter((host) => typeof host === 'string' && net.isIP(host) !== 0))];
+    if (addresses.length === 0 || budgetMs <= 0 || signal?.aborted) return hops;
+
+    const names = new Map();
+    const lookups = Promise.all(addresses.map(async (address) => {
+        try {
+            const hostname = normalizeHostname((await reverse(address))?.[0], address);
+            if (hostname) names.set(address, hostname);
+        } catch {
+            // No PTR record, or the resolver gave up: the hop keeps its address.
+        }
+    }));
+
+    let timer;
+    let onAbort;
+    const stop = new Promise((resolve) => {
+        timer = setTimeout(resolve, budgetMs);
+        timer.unref?.();
+        onAbort = resolve;
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+
+    try {
+        await Promise.race([lookups, stop]);
+    } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+    }
+
+    return hops.map((hop) => (names.has(hop.host)
+        ? { ...hop, hostname: names.get(hop.host) }
+        : hop));
+}
+
 function runCommand(command, context) {
     return new Promise((resolve) => {
         const child = spawn(command.binary, command.args, {
@@ -246,14 +314,25 @@ export async function checkDiagnostic(monitor, context) {
     }
 
     const processResult = await runCommand(command, context);
-    const hops = monitor.type === 'mtr'
+    const parsedHops = monitor.type === 'mtr'
         ? parseMtrOutput(processResult.output)
         : parseTracerouteOutput(processResult.output);
+    // The trace is already measured, so the lookups only get the time left
+    // before the check deadline; an abort meanwhile must not discard it.
+    const hops = processResult.aborted
+        ? parsedHops
+        : await resolveHopHostnames(parsedHops, {
+            budgetMs: Math.min(
+                REVERSE_DNS_BUDGET_MS,
+                (context.remainingMs?.() ?? REVERSE_DNS_BUDGET_MS) - REVERSE_DNS_DEADLINE_MARGIN_MS,
+            ),
+            signal: context.signal,
+        });
     let state = 'complete';
     if (processResult.spawnError?.code === 'ENOENT') state = 'unsupported';
     else if (processResult.aborted) state = 'timeout';
     else if (processResult.outputTruncated || processResult.code !== 0) state = hops.length > 0 ? 'partial' : 'unsupported';
-    if (processResult.aborted) context.allowAbortSettlement();
+    if (processResult.aborted || context.signal.aborted) context.allowAbortSettlement();
 
     const success = state === 'complete' || state === 'partial';
     return {

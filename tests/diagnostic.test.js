@@ -5,8 +5,10 @@ vi.mock('../src/lib/config.js', () => ({
 }));
 import {
     buildDiagnosticCommand,
+    normalizeHostname,
     parseMtrOutput,
     parseTracerouteOutput,
+    resolveHopHostnames,
     validateDiagnostic,
 } from '../src/checks/diagnostic.js';
 
@@ -117,5 +119,57 @@ describe('diagnostic checks', () => {
                 timeout: false,
             },
         ]);
+    });
+    it('attaches reverse DNS names to answering hops and keeps the address as host', async () => {
+        const reverse = vi.fn(async (address) => {
+            if (address === '192.0.2.1') return ['ae1.fra.example.net.'];
+            throw Object.assign(new Error('no PTR'), { code: 'ENOTFOUND' });
+        });
+        const hops = await resolveHopHostnames([
+            { hop: 1, host: '192.0.2.1', timeout: false },
+            { hop: 2, host: null, timeout: true },
+            { hop: 3, host: '203.0.113.10', timeout: false },
+            { hop: 4, host: '192.0.2.1', timeout: false },
+        ], { reverse });
+
+        expect(reverse).toHaveBeenCalledTimes(2);
+        expect(hops).toEqual([
+            { hop: 1, host: '192.0.2.1', hostname: 'ae1.fra.example.net', timeout: false },
+            { hop: 2, host: null, timeout: true },
+            { hop: 3, host: '203.0.113.10', timeout: false },
+            { hop: 4, host: '192.0.2.1', hostname: 'ae1.fra.example.net', timeout: false },
+        ]);
+    });
+
+    it('returns the hops unnamed once the lookup budget runs out', async () => {
+        const reverse = vi.fn(() => new Promise(() => {}));
+        const hops = [{ hop: 1, host: '192.0.2.1', timeout: false }];
+
+        await expect(resolveHopHostnames(hops, { reverse, budgetMs: 10 })).resolves.toEqual(hops);
+        await expect(resolveHopHostnames(hops, { reverse, budgetMs: 0 })).resolves.toEqual(hops);
+        expect(reverse).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops waiting for lookups when the check is aborted', async () => {
+        const controller = new AbortController();
+        const reverse = vi.fn(() => new Promise(() => {}));
+        const pending = resolveHopHostnames([{ hop: 1, host: '192.0.2.1' }], {
+            reverse,
+            budgetMs: 60_000,
+            signal: controller.signal,
+        });
+        controller.abort();
+
+        await expect(pending).resolves.toEqual([{ hop: 1, host: '192.0.2.1' }]);
+    });
+
+    it('only keeps PTR answers that are plain DNS names', () => {
+        expect(normalizeHostname('Core1.Example.NET.', '192.0.2.1')).toBe('core1.example.net');
+        expect(normalizeHostname('192.0.2.1', '192.0.2.1')).toBeNull();
+        expect(normalizeHostname('<script>alert(1)</script>', '192.0.2.1')).toBeNull();
+        expect(normalizeHostname('bad name.example', '192.0.2.1')).toBeNull();
+        expect(normalizeHostname('-edge.example', '192.0.2.1')).toBeNull();
+        expect(normalizeHostname(`${'a'.repeat(64)}.example`, '192.0.2.1')).toBeNull();
+        expect(normalizeHostname(null, '192.0.2.1')).toBeNull();
     });
 });
