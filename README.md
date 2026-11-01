@@ -111,7 +111,9 @@ All configuration is done via environment variables.
 | `PROBE_TOKEN` | The unique authentication token for this agent | **Required** |
 | `LOG_LEVEL` | Logging verbosity (`debug`, `info`, `warn`, `error`) | `info` |
 | `POLL_INTERVAL`| Time between check cycles in milliseconds | `5000` |
-| `POLL_MAX_INTERVAL` | Cap for exponential backoff under consecutive poll failures (ms). Worker rate-limits its API polls when the console is unreachable, capping the delay here. Set equal to `POLL_INTERVAL` to disable backoff. | `300000` |
+| `POLL_MAX_INTERVAL` | Cap for exponential backoff under consecutive poll failures (ms) when the console answers 403, 410 or 422. Set equal to `POLL_INTERVAL` to disable backoff. | `300000` |
+| `POLL_TRANSIENT_MAX_INTERVAL` | Backoff cap after network errors, timeouts and 5xx answers (ms). Kept short so a probe is back on schedule right after a console restart. | `30000` |
+| `POLL_REQUEST_TIMEOUT` | Hard deadline for one check poll request (ms). Stays below the 10 s console lookahead; a poll that hangs longer is aborted and sent again. | `8000` |
 | `ADHOC_POLL_INTERVAL` | Fast-lane poll interval for on-demand checks (network check, admin probe test) in milliseconds. Runs independently of the main cycle. `0` disables it; on-demand work then arrives with the main poll. | `1000` |
 | `SKIP_SSL_VERIFY` | Skip SSL certificate verification (**INSECURE**) | `false` |
 | `ALLOW_PRIVATE_TARGETS` | Global override for the SSRF guard - when `true`, the worker will accept monitor targets that resolve to private/reserved IP ranges (RFC1918, loopback, link-local, IPv6 ULA/link-local, etc.). Intended for self-hosted operators monitoring a trusted LAN. A per-monitor `allow_private_target` flag takes precedence. **Leave `false` unless you trust every monitor target.** | `false` |
@@ -198,6 +200,14 @@ are spread across it, so they do not all start in the same second.
   has answered its report, not just until the result exists. The console also
   hands out each check to one poll only, and drops a second report for the
   same slot.
+- **Slow checks stay on time**: when a check ran close to its interval (a
+  timeout, a slow target), its next slot is due right after the report. The
+  agent then polls at once instead of waiting for the regular poll, at most
+  once per second and never during a backoff. Without that, such a check
+  started a little later on every run.
+- **Own poll connection**: the check poll has a connection of its own and an
+  8 second deadline, so a stalled report request or a hung socket cannot hold
+  back legs that are due.
 - **Reports**: each result carries `slot_id`, `scheduled_at` and
   `started_at`, so the console can measure how late a check started.
 - **Falling behind**: a check that is a full interval late when its timer

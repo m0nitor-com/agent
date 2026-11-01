@@ -62,6 +62,19 @@ export const REPORT_COALESCE_IDLE_MS = 250;
 export const REPORT_MAX_IN_FLIGHT = 2;
 export const REPORT_HOT_PATH_RETRIES = 0;
 
+// --- Polling ---
+// Hard deadline for one /workers/checks request. Must stay below the console
+// lookahead (10s): a poll that hangs longer leaves every leg due meanwhile
+// late, so it is aborted and sent again on a fresh connection.
+export const POLL_REQUEST_TIMEOUT_MS = 8000;
+export const POLL_REQUEST_RETRIES = 1;
+// Backoff cap after network errors and 5xx. The full POLL_MAX_INTERVAL only
+// applies to answers that will not change by retrying (403, 410, 422).
+export const POLL_TRANSIENT_MAX_INTERVAL_MS = 30_000;
+// Closest gap between a regular poll and an early one asked for by a check
+// whose next slot is already due.
+export const POLL_WAKE_MIN_INTERVAL_MS = 1000;
+
 // --- Scheduling ---
 // A start this much after the due time counts as late in the health payload.
 export const SCHEDULE_LATE_START_MS = 1000;

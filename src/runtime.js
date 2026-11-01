@@ -20,6 +20,8 @@ import {
     HEALTH_UNHEALTHY_AFTER_FAILED_POLLS,
     MAX_MONITOR_TIMEOUT_S,
     MIN_MONITOR_TIMEOUT_S,
+    POLL_TRANSIENT_MAX_INTERVAL_MS,
+    POLL_WAKE_MIN_INTERVAL_MS,
     REPORT_COALESCE_IDLE_MS,
     REPORT_MAX_IN_FLIGHT,
     SCHEDULE_DELAY_WINDOW,
@@ -34,6 +36,10 @@ function safeError(error) {
         name: typeof error?.name === 'string' ? error.name.slice(0, 40) : undefined,
     };
 }
+
+// Answers that stay the same on retry; everything else (network, 5xx, 429)
+// is transient and backs off only briefly.
+const PERSISTENT_POLL_STATUSES = new Set([403, 410, 422]);
 
 function interruptibleDelay(ms, signal) {
     return new Promise((resolve) => {
@@ -92,12 +98,17 @@ export class AgentRuntime {
         // Detached runs started by pollOnce(); shutdown waits for them.
         this.inFlightRuns = new Set();
         this.isPolling = false;
+        // Early poll for a leg whose next slot is due before the regular one.
+        this.wakePoll = null;
+        this.wakePending = false;
         this.isShuttingDown = false;
         this.governorTimer = null;
         this.eventLoopDelay = monitorEventLoopDelay({ resolution: EVENT_LOOP_DELAY_RESOLUTION_MS });
         this.eventLoopDelay.enable();
         this.state = {
             consecutiveFailedPolls: 0,
+            lastPollErrorPersistent: false,
+            earlyPolls: 0,
             lastSuccessfulPollAt: null,
             lastPollAttemptAt: null,
             totalChecks: 0,
@@ -347,6 +358,7 @@ export class AgentRuntime {
         } catch (error) {
             if (this.isShuttingDown || this.shutdownController.signal.aborted) return null;
             this.state.consecutiveFailedPolls++;
+            this.state.lastPollErrorPersistent = PERSISTENT_POLL_STATUSES.has(error.response?.status);
             if (error.response?.status === 401) {
                 error.fatalAuthentication = true;
             }
@@ -402,6 +414,75 @@ export class AgentRuntime {
         return run;
     }
 
+    /**
+     * A leg is handed out again only after the console has its report. When
+     * the check ran close to its interval (a timeout, a slow target), the next
+     * slot is already due at that point and waiting for the regular poll made
+     * it start late, a little more on every run. Poll right away instead.
+     */
+    pollIfNextSlotIsDue(monitor) {
+        const intervalMs = Number(monitor?.interval_seconds) * 1000;
+        if (!(intervalMs > 0) || !Number.isFinite(monitor?.due_at)) return;
+        const nextDueAt = monitor.due_at + intervalMs;
+        if (nextDueAt - this.clock.serverNow() < this.config.POLL_INTERVAL) this.requestPoll();
+    }
+
+    requestPoll() {
+        if (this.isShuttingDown) return;
+        if (this.wakePoll) {
+            this.wakePoll();
+        } else {
+            // A poll is running and may have missed the report: poll once more.
+            this.wakePending = true;
+        }
+    }
+
+    /**
+     * Wait before the next poll. requestPoll() shortens the wait, but never
+     * below POLL_WAKE_MIN_INTERVAL_MS after the previous poll and never while
+     * the console is failing (backoff wins).
+     */
+    waitForNextPoll(ms) {
+        const signal = this.shutdownController.signal;
+        return new Promise((resolve) => {
+            if (signal.aborted || ms <= 0) {
+                this.wakePending = false;
+                resolve();
+                return;
+            }
+            let deadline = Date.now() + ms;
+            let timer = null;
+            let woken = false;
+            const finish = () => {
+                clearTimeout(timer);
+                signal.removeEventListener('abort', finish);
+                this.wakePoll = null;
+                if (woken) this.state.earlyPolls++;
+                resolve();
+            };
+            const arm = () => {
+                clearTimeout(timer);
+                timer = setTimeout(finish, Math.max(0, deadline - Date.now()));
+                timer.unref?.();
+            };
+            this.wakePoll = () => {
+                if (this.state.consecutiveFailedPolls > 0) return;
+                const lastPollAt = this.state.lastPollAttemptAt?.getTime() ?? 0;
+                const target = Math.max(Date.now(), lastPollAt + POLL_WAKE_MIN_INTERVAL_MS);
+                if (target >= deadline) return;
+                deadline = target;
+                woken = true;
+                arm();
+            };
+            signal.addEventListener('abort', finish, { once: true });
+            arm();
+            if (this.wakePending) {
+                this.wakePending = false;
+                this.wakePoll();
+            }
+        });
+    }
+
     /** Timer callback of the local schedule: start every leg now due. */
     startDue(entries) {
         if (this.isShuttingDown) return;
@@ -432,7 +513,9 @@ export class AgentRuntime {
         const held = new Set(legKeys);
         const release = (monitor) => {
             const key = AgentRuntime.legKey(monitor);
-            if (held.delete(key)) this.scheduledInFlight.delete(key);
+            if (!held.delete(key)) return;
+            this.scheduledInFlight.delete(key);
+            this.pollIfNextSlotIsDue(monitor);
         };
         try {
             await this.scheduler.run(
@@ -529,16 +612,26 @@ export class AgentRuntime {
                 this.currentPoll = null;
             }
 
-            const backoff = computeNextPollDelay(
-                this.config.POLL_INTERVAL,
-                this.config.POLL_MAX_INTERVAL,
-                this.state.consecutiveFailedPolls,
-            );
-            const delay = Number.isFinite(pollHint)
-                ? Math.max(250, Math.min(backoff, pollHint))
-                : backoff;
-            await interruptibleDelay(delay, this.shutdownController.signal);
+            const delay = this.nextPollDelay(pollHint);
+            await this.waitForNextPoll(delay);
         }
+    }
+
+    nextPollDelay(pollHint = null) {
+        const transientCap = this.config.POLL_TRANSIENT_MAX_INTERVAL > 0
+            ? this.config.POLL_TRANSIENT_MAX_INTERVAL
+            : POLL_TRANSIENT_MAX_INTERVAL_MS;
+        const maxInterval = this.state.lastPollErrorPersistent
+            ? this.config.POLL_MAX_INTERVAL
+            : Math.max(this.config.POLL_INTERVAL, Math.min(this.config.POLL_MAX_INTERVAL, transientCap));
+        const backoff = computeNextPollDelay(
+            this.config.POLL_INTERVAL,
+            maxInterval,
+            this.state.consecutiveFailedPolls,
+        );
+        return Number.isFinite(pollHint)
+            ? Math.max(250, Math.min(backoff, pollHint))
+            : backoff;
     }
 
     healthPayload() {
@@ -561,6 +654,7 @@ export class AgentRuntime {
                 started: this.state.scheduledChecks,
                 late_starts: this.state.lateStarts,
                 skipped_slots: this.state.skippedSlots,
+                early_polls: this.state.earlyPolls,
                 start_delay_ms: this.startDelays.percentiles(),
                 clock: this.clock.telemetry,
             },

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { logger } from './logger.js';
 import { config } from './config.js';
+import { POLL_REQUEST_RETRIES, POLL_REQUEST_TIMEOUT_MS } from './constants.js';
 
 // Get package.json version
 const __filename = fileURLToPath(import.meta.url);
@@ -62,6 +63,23 @@ class ApiClient {
             scheduling: 'lifo',
             rejectUnauthorized: !config.SKIP_SSL_VERIFY,
         });
+        // The check poll gets a connection of its own. On the shared pool it
+        // queued behind report requests and the fast lane, and one stalled
+        // request there held back every leg due in the meantime.
+        this.pollHttpAgent = new http.Agent({
+            keepAlive: true,
+            maxSockets: 1,
+            maxFreeSockets: 1,
+            timeout: 10_000,
+        });
+        this.pollHttpsAgent = new https.Agent({
+            keepAlive: true,
+            maxSockets: 1,
+            maxFreeSockets: 1,
+            timeout: 10_000,
+            rejectUnauthorized: !config.SKIP_SSL_VERIFY,
+        });
+        this.pollTimeoutMs = config.POLL_REQUEST_TIMEOUT > 0 ? config.POLL_REQUEST_TIMEOUT : POLL_REQUEST_TIMEOUT_MS;
 
         if (config.SKIP_SSL_VERIFY) {
             logger.warn('[API] SSL certificate verification is DISABLED. This is insecure!');
@@ -138,18 +156,23 @@ class ApiClient {
      * Fetch monitors that need to be checked
      */
     async getChecks(options = {}) {
+        const health = options.health
+            ? Buffer.from(JSON.stringify(options.health)).toString('base64url')
+            : null;
         return this.withRetry(async () => {
-            const health = options.health
-                ? Buffer.from(JSON.stringify(options.health)).toString('base64url')
-                : null;
+            // Per attempt: the axios timeout only fires on an idle socket, the
+            // deadline also ends a response that trickles in.
+            const deadline = AbortSignal.timeout(this.pollTimeoutMs);
+            const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
             // Timed per attempt, so a retry does not skew the clock offset.
             const sentAt = Date.now();
-            const response = Object.keys(options).length > 0
-                ? await this.client.get('/workers/checks', {
-                    signal: options.signal,
-                    headers: health ? { 'X-Agent-Health': health.slice(0, 6000) } : undefined,
-                })
-                : await this.client.get('/workers/checks');
+            const response = await this.client.get('/workers/checks', {
+                signal,
+                timeout: this.pollTimeoutMs,
+                httpAgent: this.pollHttpAgent,
+                httpsAgent: this.pollHttpsAgent,
+                headers: health ? { 'X-Agent-Health': health.slice(0, 6000) } : undefined,
+            });
             const data = response.data;
             if (data && typeof data === 'object') {
                 Object.defineProperty(data, 'timing', {
@@ -158,7 +181,7 @@ class ApiClient {
                 });
             }
             return data;
-        }, 'getChecks', options);
+        }, 'getChecks', { signal: options.signal, retries: POLL_REQUEST_RETRIES });
     }
 
     /**
@@ -166,7 +189,10 @@ class ApiClient {
      * tick a second later is the retry.
      */
     async getAdhocChecks(options = {}) {
-        const response = await this.client.get('/workers/adhoc', { signal: options.signal });
+        const response = await this.client.get('/workers/adhoc', {
+            signal: options.signal,
+            timeout: this.pollTimeoutMs,
+        });
         return response.data;
     }
 
@@ -197,6 +223,8 @@ class ApiClient {
     close() {
         this.httpAgent.destroy();
         this.httpsAgent.destroy();
+        this.pollHttpAgent.destroy();
+        this.pollHttpsAgent.destroy();
     }
 }
 

@@ -83,12 +83,60 @@ describe('ApiClient', () => {
     });
 
     describe('getChecks', () => {
-        it('calls GET /workers/checks', async () => {
+        it('calls GET /workers/checks on its own connection with a short deadline', async () => {
             const data = { monitors: [] };
             client.client.get = vi.fn().mockResolvedValue({ data });
             const result = await client.getChecks();
-            expect(client.client.get).toHaveBeenCalledWith('/workers/checks');
+            expect(client.client.get).toHaveBeenCalledWith('/workers/checks', expect.objectContaining({
+                signal: expect.any(AbortSignal),
+                timeout: 8000,
+                httpAgent: client.pollHttpAgent,
+                httpsAgent: client.pollHttpsAgent,
+            }));
+            expect(client.pollHttpsAgent).not.toBe(client.httpsAgent);
+            expect(client.pollHttpsAgent.maxSockets).toBe(1);
             expect(result).toEqual(data);
+        });
+
+        it('aborts a hanging poll at the deadline and retries once on a new attempt', async () => {
+            client.pollTimeoutMs = 20;
+            client.baseDelay = 1;
+            client.client.get = vi.fn((url, options) => new Promise((resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' })), { once: true });
+            }));
+
+            const started = Date.now();
+            await expect(client.getChecks({ signal: new AbortController().signal })).rejects.toThrow('canceled');
+            expect(client.client.get).toHaveBeenCalledTimes(2);
+            expect(Date.now() - started).toBeLessThan(1000);
+        });
+
+        it('stops without retrying when the agent shuts down', async () => {
+            const shutdown = new AbortController();
+            client.baseDelay = 1;
+            client.client.get = vi.fn((url, options) => new Promise((resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            }));
+
+            const poll = client.getChecks({ signal: shutdown.signal });
+            shutdown.abort();
+            await expect(poll).rejects.toThrow('aborted');
+            expect(client.client.get).toHaveBeenCalledTimes(1);
+        });
+
+        it('sends the health payload as a header', async () => {
+            client.client.get = vi.fn().mockResolvedValue({ data: { monitors: [] } });
+            await client.getChecks({ health: { status: 'ok' } });
+            const headers = client.client.get.mock.calls[0][1].headers;
+            expect(JSON.parse(Buffer.from(headers['X-Agent-Health'], 'base64url').toString())).toEqual({ status: 'ok' });
+        });
+    });
+
+    describe('getAdhocChecks', () => {
+        it('uses the poll deadline', async () => {
+            client.client.get = vi.fn().mockResolvedValue({ data: { monitors: [] } });
+            await client.getAdhocChecks();
+            expect(client.client.get).toHaveBeenCalledWith('/workers/adhoc', expect.objectContaining({ timeout: 8000 }));
         });
     });
 

@@ -497,4 +497,140 @@ describe('AgentRuntime', () => {
 
         await runtime.shutdown('test');
     });
+
+    describe('early poll for a leg whose next slot is due', () => {
+        it('polls right after the report when the check ran close to its interval', async () => {
+            const { runtime, resultQueue } = createRuntime({}, { POLL_INTERVAL: 5000, REPORT_COALESCE_IDLE_MS: 1 });
+            const serverNow = runtime.clock.serverNow();
+            // Due 27s ago on a 30s interval: the next slot starts in 3s, before the regular poll.
+            const leg = { id: 11, type: 'fake', timeout: 25, interval_seconds: 30, due_at: serverNow - 27_000 };
+            runtime.state.lastPollAttemptAt = new Date(Date.now() - 5000);
+
+            const startedAt = Date.now();
+            const wait = runtime.waitForNextPoll(5000);
+            runtime.launch([leg], { flush: false });
+            await wait;
+
+            expect(Date.now() - startedAt).toBeLessThan(1000);
+            expect(resultQueue.submitBatch).toHaveBeenCalledTimes(1);
+            expect(runtime.state.earlyPolls).toBe(1);
+            await runtime.shutdown('test');
+        });
+
+        it('keeps the regular cadence when the next slot is far away', () => {
+            const { runtime } = createRuntime({}, { POLL_INTERVAL: 5000 });
+            const requestPoll = vi.spyOn(runtime, 'requestPoll');
+            runtime.pollIfNextSlotIsDue({ id: 1, interval_seconds: 30, due_at: runtime.clock.serverNow() });
+            runtime.pollIfNextSlotIsDue({ id: 2, interval_seconds: 30 });
+            runtime.pollIfNextSlotIsDue({ id: 3, due_at: runtime.clock.serverNow() - 60_000 });
+            expect(requestPoll).not.toHaveBeenCalled();
+        });
+
+        it('keeps at least the minimum gap after the previous poll', async () => {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+            try {
+                const { runtime } = createRuntime({}, { POLL_INTERVAL: 5000 });
+                runtime.state.lastPollAttemptAt = new Date();
+                let done = false;
+                const wait = runtime.waitForNextPoll(5000).then(() => { done = true; });
+                runtime.requestPoll();
+
+                await vi.advanceTimersByTimeAsync(999);
+                expect(done).toBe(false);
+                await vi.advanceTimersByTimeAsync(1);
+                expect(done).toBe(true);
+                await wait;
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('does not shorten a backoff while the console is failing', async () => {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+            try {
+                const { runtime } = createRuntime({}, { POLL_INTERVAL: 5000 });
+                runtime.state.consecutiveFailedPolls = 2;
+                let done = false;
+                const wait = runtime.waitForNextPoll(8000).then(() => { done = true; });
+                runtime.requestPoll();
+
+                await vi.advanceTimersByTimeAsync(7999);
+                expect(done).toBe(false);
+                await vi.advanceTimersByTimeAsync(1);
+                expect(done).toBe(true);
+                await wait;
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('polls again soon when the request came in during a running poll', async () => {
+            vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+            try {
+                const { runtime } = createRuntime({}, { POLL_INTERVAL: 5000 });
+                runtime.state.lastPollAttemptAt = new Date();
+                runtime.requestPoll();
+                expect(runtime.wakePending).toBe(true);
+
+                let done = false;
+                const wait = runtime.waitForNextPoll(5000).then(() => { done = true; });
+                await vi.advanceTimersByTimeAsync(1000);
+                expect(done).toBe(true);
+                expect(runtime.wakePending).toBe(false);
+                await wait;
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+    });
+
+    describe('poll backoff', () => {
+        it('caps the backoff after network errors at the transient ceiling', async () => {
+            const random = vi.spyOn(Math, 'random').mockReturnValue(0.999);
+            try {
+                const { runtime } = createRuntime({
+                    getChecks: vi.fn().mockRejectedValue(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })),
+                }, { POLL_INTERVAL: 5000, POLL_MAX_INTERVAL: 300_000, POLL_TRANSIENT_MAX_INTERVAL: 30_000 });
+
+                for (let i = 0; i < 8; i++) {
+                    await expect(runtime.pollOnce()).rejects.toThrow('socket hang up');
+                }
+                expect(runtime.state.lastPollErrorPersistent).toBe(false);
+                expect(runtime.nextPollDelay()).toBe(Math.floor(0.999 * 30_000));
+            } finally {
+                random.mockRestore();
+            }
+        });
+
+        it('keeps the long backoff for answers that do not change on retry', async () => {
+            const random = vi.spyOn(Math, 'random').mockReturnValue(0.999);
+            try {
+                const { runtime } = createRuntime({
+                    getChecks: vi.fn().mockRejectedValue({ response: { status: 403 } }),
+                }, { POLL_INTERVAL: 5000, POLL_MAX_INTERVAL: 300_000, POLL_TRANSIENT_MAX_INTERVAL: 30_000 });
+
+                for (let i = 0; i < 8; i++) {
+                    await expect(runtime.pollOnce()).rejects.toEqual({ response: { status: 403 } });
+                }
+                expect(runtime.state.lastPollErrorPersistent).toBe(true);
+                expect(runtime.nextPollDelay()).toBe(Math.floor(0.999 * 300_000));
+            } finally {
+                random.mockRestore();
+            }
+        });
+
+        it('falls back to the default transient ceiling when it is not configured', async () => {
+            const random = vi.spyOn(Math, 'random').mockReturnValue(0.999);
+            try {
+                const { runtime } = createRuntime({}, { POLL_INTERVAL: 5000, POLL_MAX_INTERVAL: 300_000 });
+                runtime.state.consecutiveFailedPolls = 10;
+                expect(runtime.nextPollDelay()).toBe(Math.floor(0.999 * 30_000));
+                expect(runtime.nextPollDelay(1000)).toBe(1000);
+                runtime.state.consecutiveFailedPolls = 0;
+                expect(runtime.nextPollDelay()).toBe(5000);
+            } finally {
+                random.mockRestore();
+            }
+        });
+    });
 });
