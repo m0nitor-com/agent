@@ -159,6 +159,11 @@ class ApiClient {
         const health = options.health
             ? Buffer.from(JSON.stringify(options.health)).toString('base64url')
             : null;
+        const headers = {};
+        if (health) headers['X-Agent-Health'] = health.slice(0, 6000);
+        // A live push subscription replaces the fast poll the console would
+        // otherwise ask for after a public check.
+        if (options.pushSubscribed === true) headers['X-Agent-Push'] = 'subscribed';
         return this.withRetry(async () => {
             // Per attempt: the axios timeout only fires on an idle socket, the
             // deadline also ends a response that trickles in.
@@ -171,7 +176,7 @@ class ApiClient {
                 timeout: this.pollTimeoutMs,
                 httpAgent: this.pollHttpAgent,
                 httpsAgent: this.pollHttpsAgent,
-                headers: health ? { 'X-Agent-Health': health.slice(0, 6000) } : undefined,
+                headers: Object.keys(headers).length > 0 ? headers : undefined,
             });
             const data = response.data;
             if (data && typeof data === 'object') {
@@ -191,6 +196,21 @@ class ApiClient {
     async getAdhocChecks(options = {}) {
         const response = await this.client.get('/workers/adhoc', {
             signal: options.signal,
+            timeout: this.pollTimeoutMs,
+        });
+        return response.data;
+    }
+
+    /**
+     * Sign the push channel subscription (Pusher private channel). No
+     * retries: the push channel reconnects with its own backoff.
+     */
+    async authorizePush({ socketId, channel, signal } = {}) {
+        const response = await this.client.post('/workers/push/auth', {
+            socket_id: socketId,
+            channel_name: channel,
+        }, {
+            signal,
             timeout: this.pollTimeoutMs,
         });
         return response.data;

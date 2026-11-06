@@ -1,6 +1,7 @@
 import { cleanEnv, str, num, url, bool } from 'envalid';
 import 'dotenv/config';
 import {
+    ADHOC_PUSH_FALLBACK_INTERVAL_MS,
     DEFAULT_HEALTH_PORT,
     DEFAULT_HTTP_MAX_FREE_SOCKETS,
     DEFAULT_HTTP_MAX_SOCKETS,
@@ -34,6 +35,8 @@ const raw = cleanEnv(process.env, {
     LOG_LEVEL: str({ default: 'info', choices: ['debug', 'info', 'warn', 'error'] }),
     POLL_INTERVAL: num({ default: 5000, desc: 'Polling interval in milliseconds' }),
     ADHOC_POLL_INTERVAL: num({ default: 1000, desc: 'Fast-lane poll interval (ms) for on-demand checks. 0 disables the fast lane.' }),
+    PUSH_ENABLED: bool({ default: true, desc: 'Keep a websocket to the console and fetch on-demand checks when woken instead of polling every ADHOC_POLL_INTERVAL' }),
+    ADHOC_PUSH_FALLBACK_INTERVAL: num({ default: ADHOC_PUSH_FALLBACK_INTERVAL_MS, desc: 'Fast-lane poll interval (ms) while the push channel is connected' }),
     POLL_MAX_INTERVAL: num({ default: 300_000, desc: 'Max poll interval (ms) under exponential backoff during consecutive failures' }),
     POLL_TRANSIENT_MAX_INTERVAL: num({ default: POLL_TRANSIENT_MAX_INTERVAL_MS, desc: 'Backoff cap (ms) after network errors and 5xx answers; POLL_MAX_INTERVAL still applies to 403/410/422' }),
     POLL_REQUEST_TIMEOUT: num({ default: POLL_REQUEST_TIMEOUT_MS, desc: 'Hard deadline (ms) for one check poll request' }),

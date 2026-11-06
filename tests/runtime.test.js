@@ -634,3 +634,118 @@ describe('AgentRuntime', () => {
         });
     });
 });
+
+describe('AgentRuntime push channel', () => {
+    function fakePush(subscribed) {
+        return {
+            subscribed,
+            telemetry: { state: subscribed ? 'subscribed' : 'idle', connects: 0, wakes: 0 },
+            configure: vi.fn(),
+            stop: vi.fn(),
+        };
+    }
+
+    function pushRuntime(push, apiOverrides = {}, configOverrides = {}) {
+        const registry = new CheckRegistry().register('fake', {
+            capability: 'fake',
+            budget: 'network',
+            validate: (raw) => raw,
+            handler: async (monitor) => ({ monitor_id: monitor.id, is_success: true, response_time_ms: 1 }),
+        });
+        const api = {
+            getChecks: vi.fn().mockResolvedValue({ monitors: [] }),
+            getAdhocChecks: vi.fn().mockResolvedValue({ monitors: [] }),
+            close: vi.fn(),
+            ...apiOverrides,
+        };
+        const runtime = new AgentRuntime({
+            config: baseConfig({ ADHOC_POLL_INTERVAL: 10, ADHOC_PUSH_FALLBACK_INTERVAL: 60_000, ...configOverrides }),
+            logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+            registry,
+            api,
+            resultQueue: {
+                submitBatch: vi.fn().mockResolvedValue(true),
+                flush: vi.fn().mockResolvedValue(true),
+                dropOldest: vi.fn().mockReturnValue(0),
+                size: 0,
+                telemetry: { size: 0, bytes: 0, counters: {} },
+            },
+            version: 'test',
+            push,
+        });
+        return { runtime, api };
+    }
+
+    it('fetches on-demand checks only when woken while subscribed', async () => {
+        const { runtime, api } = pushRuntime(fakePush(true));
+        const lane = runtime.runAdhocLoop();
+
+        await vi.waitFor(() => expect(api.getAdhocChecks).toHaveBeenCalledTimes(1));
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        expect(api.getAdhocChecks).toHaveBeenCalledTimes(1);
+
+        runtime.wakeAdhoc();
+        await vi.waitFor(() => expect(api.getAdhocChecks).toHaveBeenCalledTimes(2));
+
+        await runtime.shutdown('test');
+        await lane;
+    });
+
+    it('keeps the one-second lane while push is down', async () => {
+        const { runtime, api } = pushRuntime(fakePush(false));
+        const lane = runtime.runAdhocLoop();
+
+        await vi.waitFor(() => expect(api.getAdhocChecks.mock.calls.length).toBeGreaterThanOrEqual(3));
+
+        await runtime.shutdown('test');
+        await lane;
+    });
+
+    it('fetches again at once when woken during a fetch', async () => {
+        let release;
+        const first = new Promise((resolve) => { release = resolve; });
+        const getAdhocChecks = vi.fn()
+            .mockReturnValueOnce(first)
+            .mockResolvedValue({ monitors: [] });
+        const { runtime, api } = pushRuntime(fakePush(true), { getAdhocChecks });
+        const lane = runtime.runAdhocLoop();
+
+        await vi.waitFor(() => expect(api.getAdhocChecks).toHaveBeenCalledTimes(1));
+        runtime.wakeAdhoc();
+        release({ monitors: [] });
+        await vi.waitFor(() => expect(api.getAdhocChecks).toHaveBeenCalledTimes(2));
+
+        await runtime.shutdown('test');
+        await lane;
+    });
+
+    it('hands the push settings of each poll to the channel and reports the subscription', async () => {
+        const push = fakePush(true);
+        const settings = { key: 'k', host: 'm0nitor.test', port: 443, scheme: 'https', path: '/ws', channel: 'private-probe-location.1' };
+        const { runtime, api } = pushRuntime(push, {
+            getChecks: vi.fn().mockResolvedValue({ monitors: [], push: settings }),
+        });
+
+        await runtime.pollOnce();
+        expect(push.configure).toHaveBeenCalledWith(settings);
+        expect(api.getChecks).toHaveBeenCalledWith(expect.objectContaining({ pushSubscribed: true }));
+        expect(runtime.healthPayload().push).toEqual(push.telemetry);
+
+        api.getChecks.mockResolvedValue({ monitors: [] });
+        await runtime.pollOnce();
+        expect(push.configure).toHaveBeenLastCalledWith(null);
+
+        await runtime.shutdown('test');
+        expect(push.stop).toHaveBeenCalled();
+    });
+
+    it('stays on polling without an API client that can sign push', () => {
+        const { runtime } = createRuntime();
+        expect(runtime.push).toBeNull();
+    });
+
+    it('can be switched off', () => {
+        const { runtime } = pushRuntime(undefined, { authorizePush: vi.fn() }, { PUSH_ENABLED: false });
+        expect(runtime.push).toBeNull();
+    });
+});

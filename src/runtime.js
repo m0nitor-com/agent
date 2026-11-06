@@ -10,7 +10,9 @@ import { ResourceGovernor } from './lib/resource-governor.js';
 import { EgressDetector } from './lib/egress-detect.js';
 import { ClockSync } from './lib/clock.js';
 import { DueSchedule, LatencyWindow } from './lib/due-schedule.js';
+import { PushChannel } from './lib/push-channel.js';
 import {
+    ADHOC_PUSH_FALLBACK_INTERVAL_MS,
     CHECK_WATCHDOG_BUFFER_MS,
     DEFAULT_MONITOR_TIMEOUT_S,
     EVENT_LOOP_DELAY_RESOLUTION_MS,
@@ -67,7 +69,7 @@ function monitorTimeoutMs(monitor) {
 }
 
 export class AgentRuntime {
-    constructor({ config, logger, registry, api, resultQueue, version, budgets = null }) {
+    constructor({ config, logger, registry, api, resultQueue, version, budgets = null, push = undefined }) {
         this.config = config;
         this.logger = logger;
         this.registry = registry;
@@ -84,6 +86,9 @@ export class AgentRuntime {
         // poll (which still carries adhoc work for older consoles) never runs
         // a leg the fast lane already has.
         this.adhocInFlight = new Set();
+        // Resolves the fast lane's current wait early (push wake-up).
+        this.adhocWake = null;
+        this.adhocWakePending = false;
         // Scheduled legs (monitor id + family) from receipt until the console
         // has acknowledged their report: waiting for their due time, running,
         // or with the report still in flight. A poll that returns such a leg
@@ -177,6 +182,36 @@ export class AgentRuntime {
             enabled: config.EGRESS_DETECT !== false,
             skipSslVerify: config.SKIP_SSL_VERIFY === true,
             logger: this.logger,
+        });
+        this.push = push !== undefined ? push : this.createPushChannel();
+    }
+
+    /**
+     * The websocket that wakes the fast lane. Null keeps the agent on plain
+     * polling: switched off, no WebSocket in this runtime, or an API client
+     * without push support.
+     */
+    createPushChannel() {
+        if (this.config.PUSH_ENABLED === false || !PushChannel.supported()) return null;
+        if (typeof this.api?.authorizePush !== 'function') return null;
+        return new PushChannel({
+            authorize: ({ socketId, channel }) => this.api.authorizePush({
+                socketId,
+                channel,
+                signal: this.shutdownController.signal,
+            }),
+            onWork: () => this.wakeAdhoc(),
+            onStateChange: (subscribed) => {
+                this.logger.info(
+                    { subscribed },
+                    subscribed ? '[PUSH] Subscribed, on-demand checks arrive by push' : '[PUSH] Push channel down, polling for on-demand checks',
+                );
+                // Catch up on anything queued while the channel changed state,
+                // and switch the fast lane to the matching interval right away.
+                this.wakeAdhoc();
+            },
+            logger: this.logger,
+            version: this.version,
         });
     }
 
@@ -315,6 +350,7 @@ export class AgentRuntime {
             const data = await this.api.getChecks({
                 signal: this.shutdownController.signal,
                 health: this.healthPayload(),
+                pushSubscribed: this.push?.subscribed === true,
             });
             this.state.consecutiveFailedPolls = 0;
             this.state.lastSuccessfulPollAt = new Date();
@@ -323,6 +359,8 @@ export class AgentRuntime {
             }
 
             this.applyRemoteBudgets(data.worker?.budgets);
+            // No push block (older console, push off) closes the channel.
+            this.push?.configure(data?.push ?? null);
 
             if (data.worker?.latest_version && data.worker.latest_version !== this.version) {
                 if (this.state.latestAvailableVersion !== data.worker.latest_version) {
@@ -568,6 +606,9 @@ export class AgentRuntime {
      * Each batch runs detached, so a slow target never delays the next pickup.
      * A console without /workers/adhoc answers 404 once and the lane retires;
      * adhoc work then still arrives through the main poll.
+     *
+     * While the push channel is subscribed the console wakes the lane when
+     * work is queued, so it only polls on the slow fallback interval.
      */
     async runAdhocLoop() {
         const interval = this.config.ADHOC_POLL_INTERVAL;
@@ -575,6 +616,7 @@ export class AgentRuntime {
 
         let failures = 0;
         while (!this.isShuttingDown) {
+            this.adhocWakePending = false;
             try {
                 const data = await this.api.getAdhocChecks({ signal: this.shutdownController.signal });
                 failures = 0;
@@ -593,11 +635,50 @@ export class AgentRuntime {
                 }
                 failures++;
             }
-            const delay = failures > 0
-                ? computeNextPollDelay(interval, this.config.POLL_MAX_INTERVAL, failures)
-                : interval;
-            await interruptibleDelay(delay, this.shutdownController.signal);
+            if (failures > 0) {
+                await interruptibleDelay(
+                    computeNextPollDelay(interval, this.config.POLL_MAX_INTERVAL, failures),
+                    this.shutdownController.signal,
+                );
+                continue;
+            }
+            // Woken while this fetch was running: the work may have been
+            // queued after the console answered, so fetch once more now.
+            if (this.adhocWakePending) continue;
+            await this.waitForAdhoc(this.push?.subscribed ? this.adhocPushFallbackInterval() : interval);
         }
+    }
+
+    adhocPushFallbackInterval() {
+        const fallback = this.config.ADHOC_PUSH_FALLBACK_INTERVAL;
+        return Number.isFinite(fallback) && fallback > 0 ? fallback : ADHOC_PUSH_FALLBACK_INTERVAL_MS;
+    }
+
+    /** Wait for the fast lane's next tick; wakeAdhoc() ends the wait early. */
+    waitForAdhoc(ms) {
+        const signal = this.shutdownController.signal;
+        return new Promise((resolve) => {
+            if (signal.aborted || ms <= 0) {
+                resolve();
+                return;
+            }
+            const timer = setTimeout(done, ms);
+            timer.unref?.();
+            this.adhocWake = done;
+            signal.addEventListener('abort', done, { once: true });
+            function done() {
+                clearTimeout(timer);
+                signal.removeEventListener('abort', done);
+                resolve();
+            }
+        }).finally(() => {
+            this.adhocWake = null;
+        });
+    }
+
+    wakeAdhoc() {
+        this.adhocWakePending = true;
+        this.adhocWake?.();
     }
 
     async runLoop() {
@@ -701,6 +782,7 @@ export class AgentRuntime {
                 reduction_steps: governor.reduction_steps ?? 0,
             },
             egress: this.egress.snapshot(),
+            push: this.push?.telemetry ?? null,
         };
     }
 
@@ -785,6 +867,7 @@ export class AgentRuntime {
         this.isShuttingDown = true;
         this.logger.info({ reason }, '[AGENT] Graceful shutdown started');
         this.shutdownController.abort(new Error(`Agent shutdown: ${reason}`));
+        this.push?.stop();
         // Legs not started yet are simply not run; the console lease expires
         // and another probe or the next start picks them up.
         for (const { item } of this.dueSchedule.stop()) {

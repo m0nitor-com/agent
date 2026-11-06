@@ -130,6 +130,34 @@ describe('ApiClient', () => {
             const headers = client.client.get.mock.calls[0][1].headers;
             expect(JSON.parse(Buffer.from(headers['X-Agent-Health'], 'base64url').toString())).toEqual({ status: 'ok' });
         });
+
+        it('announces a live push subscription', async () => {
+            client.client.get = vi.fn().mockImplementation(async () => ({ data: { monitors: [] } }));
+            await client.getChecks({ pushSubscribed: true });
+            expect(client.client.get.mock.calls[0][1].headers['X-Agent-Push']).toBe('subscribed');
+
+            await client.getChecks({ pushSubscribed: false });
+            expect(client.client.get.mock.calls[1][1].headers).toBeUndefined();
+        });
+    });
+
+    describe('authorizePush', () => {
+        it('posts socket and channel and returns the signature', async () => {
+            client.client.post = vi.fn().mockResolvedValue({ data: { auth: 'key:sig' } });
+            const result = await client.authorizePush({ socketId: '1.2', channel: 'private-probe-location.7' });
+            expect(result).toEqual({ auth: 'key:sig' });
+            expect(client.client.post).toHaveBeenCalledWith(
+                '/workers/push/auth',
+                { socket_id: '1.2', channel_name: 'private-probe-location.7' },
+                expect.objectContaining({ timeout: 8000 }),
+            );
+        });
+
+        it('does not retry', async () => {
+            client.client.post = vi.fn().mockRejectedValue({ response: { status: 500 } });
+            await expect(client.authorizePush({ socketId: '1.2', channel: 'c' })).rejects.toEqual({ response: { status: 500 } });
+            expect(client.client.post).toHaveBeenCalledTimes(1);
+        });
     });
 
     describe('getAdhocChecks', () => {
