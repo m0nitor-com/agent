@@ -75,6 +75,22 @@ export const POLL_TRANSIENT_MAX_INTERVAL_MS = 30_000;
 // whose next slot is already due.
 export const POLL_WAKE_MIN_INTERVAL_MS = 1000;
 
+// --- Push channel (Pusher protocol over the console's Reverb server) ---
+// The only event the console sends: on-demand work waits at this location.
+export const PUSH_WORK_EVENT = 'work.available';
+// Used until the server announces its own activity_timeout.
+export const PUSH_ACTIVITY_TIMEOUT_MS = 30_000;
+// After our ping, the server has this long to answer before we reconnect.
+export const PUSH_PONG_TIMEOUT_MS = 30_000;
+export const PUSH_RECONNECT_BASE_MS = 1000;
+export const PUSH_RECONNECT_MAX_MS = 60_000;
+// The console refused push (disabled, wrong channel, unknown app): retry
+// rarely, polling covers the gap.
+export const PUSH_UNAVAILABLE_RETRY_MS = 5 * 60 * 1000;
+// Fast-lane poll while the push channel is live. Only a safety net for a
+// lost wake-up; the checks poll also carries on-demand work.
+export const ADHOC_PUSH_FALLBACK_INTERVAL_MS = 30_000;
+
 // --- Scheduling ---
 // A start this much after the due time counts as late in the health payload.
 export const SCHEDULE_LATE_START_MS = 1000;
