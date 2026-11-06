@@ -6,7 +6,13 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { logger } from './logger.js';
 import { config } from './config.js';
-import { POLL_REQUEST_RETRIES, POLL_REQUEST_TIMEOUT_MS } from './constants.js';
+import { randomBytes } from 'crypto';
+import {
+    ABANDONED_POLL_NAME_MS,
+    MAX_ABANDONED_POLL_IDS,
+    POLL_REQUEST_RETRIES,
+    POLL_REQUEST_TIMEOUT_MS,
+} from './constants.js';
 
 // Get package.json version
 const __filename = fileURLToPath(import.meta.url);
@@ -80,6 +86,11 @@ class ApiClient {
             rejectUnauthorized: !config.SKIP_SSL_VERIFY,
         });
         this.pollTimeoutMs = config.POLL_REQUEST_TIMEOUT > 0 ? config.POLL_REQUEST_TIMEOUT : POLL_REQUEST_TIMEOUT_MS;
+        // Ids of poll attempts, unique per process, and the given-up ones that
+        // are still named to the console.
+        this.pollIdPrefix = randomBytes(4).toString('hex');
+        this.pollSeq = 0;
+        this.abandonedPolls = [];
 
         if (config.SKIP_SSL_VERIFY) {
             logger.warn('[API] SSL certificate verification is DISABLED. This is insecure!');
@@ -171,13 +182,38 @@ class ApiClient {
             const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
             // Timed per attempt, so a retry does not skew the clock offset.
             const sentAt = Date.now();
-            const response = await this.client.get('/workers/checks', {
-                signal,
-                timeout: this.pollTimeoutMs,
-                httpAgent: this.pollHttpAgent,
-                httpsAgent: this.pollHttpsAgent,
-                headers: Object.keys(headers).length > 0 ? headers : undefined,
-            });
+            // The console leases the legs it hands out. When this attempt is
+            // given up, its answer and with it those legs are lost until the
+            // lease runs out. Two guards against that:
+            // - The attempt carries an id, and given-up ids are named on the
+            //   following attempts, so the console frees their legs at once.
+            //   This covers an answer that never arrives.
+            // - The attempt says when it left and how long it is waited for,
+            //   so a request that only reaches the console after that gets no
+            //   legs at all. Only with a synced clock: an unsynced one would
+            //   make a healthy poll look stale.
+            const pollId = `${this.pollIdPrefix}-${(++this.pollSeq).toString(36)}`;
+            const attemptHeaders = { ...headers, 'X-Agent-Poll-Id': pollId };
+            const named = this.namedAbandonedPolls();
+            if (named.length > 0) attemptHeaders['X-Agent-Abandoned-Polls'] = named.join(',');
+            const serverSentAt = options.serverNow?.();
+            if (Number.isFinite(serverSentAt)) {
+                attemptHeaders['X-Agent-Sent-At'] = String(Math.round(serverSentAt));
+                attemptHeaders['X-Agent-Poll-Timeout'] = String(this.pollTimeoutMs);
+            }
+            let response;
+            try {
+                response = await this.client.get('/workers/checks', {
+                    signal,
+                    timeout: this.pollTimeoutMs,
+                    httpAgent: this.pollHttpAgent,
+                    httpsAgent: this.pollHttpsAgent,
+                    headers: attemptHeaders,
+                });
+            } catch (error) {
+                this.rememberAbandonedPoll(pollId);
+                throw error;
+            }
             const data = response.data;
             if (data && typeof data === 'object') {
                 Object.defineProperty(data, 'timing', {
@@ -187,6 +223,20 @@ class ApiClient {
             }
             return data;
         }, 'getChecks', { signal: options.signal, retries: POLL_REQUEST_RETRIES });
+    }
+
+    /** Keep a given-up attempt to be named; the newest win. */
+    rememberAbandonedPoll(pollId, at = Date.now()) {
+        this.abandonedPolls.push({ id: pollId, at });
+        if (this.abandonedPolls.length > MAX_ABANDONED_POLL_IDS) {
+            this.abandonedPolls.splice(0, this.abandonedPolls.length - MAX_ABANDONED_POLL_IDS);
+        }
+    }
+
+    /** Given-up attempts whose leases may still be held. */
+    namedAbandonedPolls(now = Date.now()) {
+        this.abandonedPolls = this.abandonedPolls.filter((poll) => now - poll.at < ABANDONED_POLL_NAME_MS);
+        return this.abandonedPolls.map((poll) => poll.id);
     }
 
     /**

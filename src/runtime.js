@@ -351,6 +351,11 @@ export class AgentRuntime {
                 signal: this.shutdownController.signal,
                 health: this.healthPayload(),
                 pushSubscribed: this.push?.subscribed === true,
+                // Read first: serverNow() itself notices a host clock jump.
+                serverNow: () => {
+                    const now = this.clock.serverNow();
+                    return this.clock.samples > 0 ? now : null;
+                },
             });
             this.state.consecutiveFailedPolls = 0;
             this.state.lastSuccessfulPollAt = new Date();

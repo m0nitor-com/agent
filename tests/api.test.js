@@ -131,13 +131,79 @@ describe('ApiClient', () => {
             expect(JSON.parse(Buffer.from(headers['X-Agent-Health'], 'base64url').toString())).toEqual({ status: 'ok' });
         });
 
+        it('sends a fresh send time and its own timeout with every attempt', async () => {
+            client.pollTimeoutMs = 20;
+            client.baseDelay = 1;
+            let now = 1_000_000;
+            client.client.get = vi.fn((url, options) => new Promise((resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' })), { once: true });
+            }));
+
+            await expect(client.getChecks({ serverNow: () => (now += 5_000) })).rejects.toThrow('canceled');
+
+            const [first, retry] = client.client.get.mock.calls.map((call) => call[1].headers);
+            expect(first['X-Agent-Sent-At']).toBe('1005000');
+            expect(retry['X-Agent-Sent-At']).toBe('1010000');
+            expect(first['X-Agent-Poll-Timeout']).toBe('20');
+        });
+
+        it('leaves the send time out while the clock is not synced', async () => {
+            client.client.get = vi.fn().mockResolvedValue({ data: { monitors: [] } });
+            await client.getChecks({ serverNow: () => null });
+            const headers = client.client.get.mock.calls[0][1].headers;
+            expect(headers['X-Agent-Sent-At']).toBeUndefined();
+            expect(headers['X-Agent-Poll-Timeout']).toBeUndefined();
+        });
+
+        it('gives every attempt its own id and names a given-up one on the retry', async () => {
+            client.baseDelay = 1;
+            client.client.get = vi.fn()
+                .mockRejectedValueOnce(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' }))
+                .mockResolvedValue({ data: { monitors: [] } });
+
+            await client.getChecks();
+
+            const [lost, retry] = client.client.get.mock.calls.map((call) => call[1].headers);
+            expect(lost['X-Agent-Poll-Id']).toMatch(/^[0-9a-f]{8}-[0-9a-z]+$/);
+            expect(retry['X-Agent-Poll-Id']).not.toBe(lost['X-Agent-Poll-Id']);
+            expect(retry['X-Agent-Abandoned-Polls']).toBe(lost['X-Agent-Poll-Id']);
+            expect(lost['X-Agent-Abandoned-Polls']).toBeUndefined();
+        });
+
+        it('keeps naming a given-up attempt after a poll got through, until its leases have run out', async () => {
+            client.baseDelay = 1;
+            client.client.get = vi.fn()
+                .mockRejectedValueOnce(new Error('socket hang up'))
+                .mockRejectedValueOnce(new Error('socket hang up'))
+                .mockImplementation(async () => ({ data: { monitors: [] } }));
+
+            await expect(client.getChecks()).rejects.toThrow('socket hang up');
+            await client.getChecks();
+            await client.getChecks();
+
+            const named = client.client.get.mock.calls.map((call) => call[1].headers['X-Agent-Abandoned-Polls']);
+            expect(named[2].split(',')).toHaveLength(2);
+            expect(named[3]).toBe(named[2]);
+
+            client.abandonedPolls.forEach((poll) => { poll.at -= 6 * 60_000; });
+            await client.getChecks();
+            expect(client.client.get.mock.calls[4][1].headers['X-Agent-Abandoned-Polls']).toBeUndefined();
+        });
+
+        it('names no more given-up attempts than the console reads', () => {
+            for (let i = 0; i < 25; i++) client.rememberAbandonedPoll(`a-${i}`);
+            const named = client.namedAbandonedPolls();
+            expect(named).toHaveLength(10);
+            expect(named[9]).toBe('a-24');
+        });
+
         it('announces a live push subscription', async () => {
             client.client.get = vi.fn().mockImplementation(async () => ({ data: { monitors: [] } }));
             await client.getChecks({ pushSubscribed: true });
             expect(client.client.get.mock.calls[0][1].headers['X-Agent-Push']).toBe('subscribed');
 
             await client.getChecks({ pushSubscribed: false });
-            expect(client.client.get.mock.calls[1][1].headers).toBeUndefined();
+            expect(client.client.get.mock.calls[1][1].headers['X-Agent-Push']).toBeUndefined();
         });
     });
 

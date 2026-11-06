@@ -68,6 +68,13 @@ export const REPORT_HOT_PATH_RETRIES = 0;
 // late, so it is aborted and sent again on a fresh connection.
 export const POLL_REQUEST_TIMEOUT_MS = 8000;
 export const POLL_REQUEST_RETRIES = 1;
+// Given-up poll attempts are named on every poll so the console frees the legs
+// it leased for them. Named for as long as such a lease can live (due time up
+// to 10 s ahead, check timeout up to 300 s, 30 s slack): a console still busy
+// with the given-up request may lease more after the first release. Bounded:
+// the console reads no more ids than this either.
+export const MAX_ABANDONED_POLL_IDS = 10;
+export const ABANDONED_POLL_NAME_MS = 6 * 60_000;
 // Backoff cap after network errors and 5xx. The full POLL_MAX_INTERVAL only
 // applies to answers that will not change by retrying (403, 410, 422).
 export const POLL_TRANSIENT_MAX_INTERVAL_MS = 30_000;

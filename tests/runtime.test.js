@@ -447,6 +447,22 @@ describe('AgentRuntime', () => {
         await runtime.shutdown('test');
     });
 
+    it('hands the poll a send time only once the clock is synced', async () => {
+        const { runtime, api } = createRuntime();
+
+        await runtime.pollOnce();
+        expect(api.getChecks.mock.calls[0][0].serverNow()).toBeNull();
+
+        runtime.clock.observe(Date.now() + 2_000, Date.now(), Date.now());
+        await runtime.pollOnce();
+        expect(api.getChecks.mock.calls[1][0].serverNow()).toBeGreaterThan(Date.now() + 1_000);
+
+        // A host clock jump noticed in that very read sends no send time.
+        runtime.clock.lastWallMs -= 30_000;
+        expect(api.getChecks.mock.calls[1][0].serverNow()).toBeNull();
+        await runtime.shutdown('test');
+    });
+
     it('skips a slot that is a full interval late instead of running it', () => {
         const { runtime } = createRuntime();
         const leg = { id: 5, type: 'fake', timeout: 5, interval_seconds: 30, due_at: 0 };

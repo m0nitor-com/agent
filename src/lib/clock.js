@@ -7,15 +7,53 @@
  * slow round trip counts less because its midpoint is less certain. With this
  * the agent schedules on console time even when the host clock is off, so NTP
  * on the host is not required.
+ *
+ * When the host clock jumps (an NTP step, someone setting the time) the offset
+ * no longer fits. The jump is not corrected by guesswork - a suspended host
+ * looks the same to the monotonic clock and would be "corrected" wrongly -
+ * instead the clock counts as unsynced until the next poll measures it anew.
  */
 export class ClockSync {
-    constructor({ alpha = 0.2, maxRttMs = 5000, now = () => Date.now() } = {}) {
+    constructor({
+        alpha = 0.2,
+        maxRttMs = 5000,
+        stepMs = 1000,
+        now = () => Date.now(),
+        monotonic = () => performance.now(),
+    } = {}) {
         this.alpha = alpha;
         this.maxRttMs = maxRttMs;
+        this.stepMs = stepMs;
         this.now = now;
+        this.monotonic = monotonic;
         this.offsetMs = 0;
         this.samples = 0;
         this.lastRttMs = null;
+        this.steps = 0;
+        this.lastWallMs = null;
+        this.lastMonotonicMs = null;
+    }
+
+    /**
+     * True when the host clock moved by more than stepMs against the monotonic
+     * clock since the last look. Resets the sync, so the next sample is taken
+     * as is instead of being smoothed into an offset that no longer fits.
+     */
+    detectStep() {
+        const wall = this.now();
+        const mono = this.monotonic();
+        const previousWall = this.lastWallMs;
+        const previousMono = this.lastMonotonicMs;
+        this.lastWallMs = wall;
+        this.lastMonotonicMs = mono;
+        if (previousWall === null) return false;
+
+        const jump = (wall - previousWall) - (mono - previousMono);
+        if (Math.abs(jump) <= this.stepMs) return false;
+
+        this.samples = 0;
+        this.steps++;
+        return true;
     }
 
     /**
@@ -24,6 +62,8 @@ export class ClockSync {
      * @param {number} receivedAtMs local time the response arrived
      */
     observe(serverTimeMs, sentAtMs, receivedAtMs) {
+        // A jump during the request makes this round trip worthless as well.
+        if (this.detectStep()) return false;
         if (!Number.isFinite(serverTimeMs) || serverTimeMs <= 0) return false;
         const rtt = receivedAtMs - sentAtMs;
         if (!(rtt >= 0) || rtt > this.maxRttMs) return false;
@@ -43,6 +83,7 @@ export class ClockSync {
 
     /** Current time on the console clock, in epoch ms. */
     serverNow() {
+        this.detectStep();
         return this.now() + this.offsetMs;
     }
 
@@ -56,6 +97,7 @@ export class ClockSync {
             offset_ms: Math.round(this.offsetMs),
             samples: this.samples,
             last_rtt_ms: this.lastRttMs,
+            steps: this.steps,
         };
     }
 }

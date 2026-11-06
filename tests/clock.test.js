@@ -37,4 +37,49 @@ describe('ClockSync', () => {
         expect(slow.offsetMs).toBeGreaterThan(0);
         expect(slow.offsetMs).toBeLessThan(fast.offsetMs);
     });
+
+    describe('host clock jumps', () => {
+        function steppingClock() {
+            const t = { wall: 1_000_000, mono: 5_000 };
+            const clock = new ClockSync({ now: () => t.wall, monotonic: () => t.mono });
+            const advance = (ms) => { t.wall += ms; t.mono += ms; };
+            return { clock, t, advance };
+        }
+
+        it('keeps the sync while wall and monotonic time run together', () => {
+            const { clock, advance } = steppingClock();
+            clock.observe(1_000_100, 1_000_000, 1_000_000);
+            for (let i = 0; i < 20; i++) {
+                advance(5_000);
+                clock.serverNow();
+            }
+            expect(clock.samples).toBe(1);
+            expect(clock.steps).toBe(0);
+        });
+
+        it('drops the sync when the host clock steps, and resyncs from the next poll', () => {
+            const { clock, t, advance } = steppingClock();
+            clock.observe(1_000_100, 1_000_000, 1_000_000);
+            expect(clock.serverNow()).toBe(1_000_100);
+
+            advance(1_000);
+            t.wall -= 30_000;
+            clock.serverNow();
+            expect(clock.samples).toBe(0);
+            expect(clock.steps).toBe(1);
+
+            advance(5_000);
+            const now = t.wall;
+            expect(clock.observe(now + 31_100, now, now)).toBe(true);
+            expect(clock.serverNow()).toBe(now + 31_100);
+        });
+
+        it('ignores a round trip during which the clock stepped', () => {
+            const { clock, t } = steppingClock();
+            clock.observe(1_000_100, 1_000_000, 1_000_000);
+            t.wall += 10_000;
+            expect(clock.observe(t.wall + 100, t.wall, t.wall)).toBe(false);
+            expect(clock.samples).toBe(0);
+        });
+    });
 });
