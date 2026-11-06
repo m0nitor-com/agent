@@ -130,7 +130,7 @@ All configuration is done via environment variables.
 | `RESULT_QUEUE_MAX_BYTES` | Maximum serialized retry queue size. | SKU / formula |
 | `REPORT_BATCH_MAX_SIZE` | Maximum results per micro-batched report request. | SKU / formula |
 | `REPORT_BATCH_MAX_BYTES` | Maximum serialized report request size. | SKU / formula |
-| `REPORT_COALESCE_IDLE_MS` | Idle flush delay for report micro-batches (ms). | `30` |
+| `REPORT_COALESCE_IDLE_MS` | Idle flush delay for report micro-batches (ms). | `250` |
 | `REPORT_MAX_IN_FLIGHT` | Max concurrent report-batch HTTP requests. | `2` |
 | `SOFT_RSS_BYTES` | RSS soft limit - reduces effective concurrency. | SKU / formula |
 | `HARD_RSS_BYTES` | RSS hard limit - pauses scheduler, drops oldest queued results, sets `saturated`. | SKU / formula |
