@@ -74,6 +74,23 @@ describe('ClockSync', () => {
             expect(clock.serverNow()).toBe(now + 31_100);
         });
 
+        it('measures against the stepped clock when the jump was noticed mid request', () => {
+            const { clock, t, advance } = steppingClock();
+            clock.observe(1_000_100, 1_000_000, 1_000_000);
+            advance(5_000);
+            const sentAt = t.wall;
+            advance(50);
+            t.wall += 3_000;
+            // A timer reads the clock and drops the sync before the answer is in.
+            clock.serverNow();
+            expect(clock.samples).toBe(0);
+            advance(50);
+
+            // The console stamped the midpoint: 100 ms ahead of the old clock.
+            expect(clock.observe(sentAt + 150, sentAt, t.wall, 100)).toBe(true);
+            expect(clock.serverNow()).toBe(sentAt + 200);
+        });
+
         it('ignores a round trip during which the clock stepped', () => {
             const { clock, t } = steppingClock();
             clock.observe(1_000_100, 1_000_000, 1_000_000);

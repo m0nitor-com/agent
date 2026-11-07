@@ -447,6 +447,24 @@ describe('AgentRuntime', () => {
         await runtime.shutdown('test');
     });
 
+    it('names a poll whose answer could not be taken up as given up', async () => {
+        const response = { monitors: [{ id: 3, type: 'fake', timeout: 5, due_at: Date.now() + 2_000 }] };
+        Object.defineProperty(response, 'timing', { value: { sentAt: Date.now(), receivedAt: Date.now(), pollId: 'abc-1' } });
+        const { runtime, api } = createRuntime({
+            getChecks: vi.fn().mockResolvedValue(response),
+            rememberAbandonedPoll: vi.fn(),
+        });
+        vi.spyOn(runtime, 'validateMonitors').mockImplementationOnce(() => { throw new Error('boom'); });
+
+        await expect(runtime.pollOnce()).rejects.toThrow('boom');
+        expect(api.rememberAbandonedPoll).toHaveBeenCalledWith('abc-1');
+
+        await runtime.pollOnce();
+        expect(api.rememberAbandonedPoll).toHaveBeenCalledTimes(1);
+        expect(runtime.scheduledInFlight.has('3:')).toBe(true);
+        await runtime.shutdown('test');
+    });
+
     it('hands the poll a send time only once the clock is synced', async () => {
         const { runtime, api } = createRuntime();
 

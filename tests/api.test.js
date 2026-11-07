@@ -190,6 +190,16 @@ describe('ApiClient', () => {
             expect(client.client.get.mock.calls[4][1].headers['X-Agent-Abandoned-Polls']).toBeUndefined();
         });
 
+        it('hands the answer its poll id and a monotonic round trip', async () => {
+            client.client.get = vi.fn().mockResolvedValue({ data: { monitors: [] } });
+
+            const data = await client.getChecks();
+
+            expect(data.timing.pollId).toBe(client.client.get.mock.calls[0][1].headers['X-Agent-Poll-Id']);
+            expect(data.timing.monotonicRttMs).toBeGreaterThanOrEqual(0);
+            expect(Object.keys(data)).toEqual(['monitors']);
+        });
+
         it('names no more given-up attempts than the console reads', () => {
             for (let i = 0; i < 25; i++) client.rememberAbandonedPoll(`a-${i}`);
             const named = client.namedAbandonedPolls();

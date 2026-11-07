@@ -182,6 +182,7 @@ class ApiClient {
             const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
             // Timed per attempt, so a retry does not skew the clock offset.
             const sentAt = Date.now();
+            const sentMono = performance.now();
             // The console leases the legs it hands out. When this attempt is
             // given up, its answer and with it those legs are lost until the
             // lease runs out. Two guards against that:
@@ -217,7 +218,12 @@ class ApiClient {
             const data = response.data;
             if (data && typeof data === 'object') {
                 Object.defineProperty(data, 'timing', {
-                    value: { sentAt, receivedAt: Date.now() },
+                    value: {
+                        sentAt,
+                        receivedAt: Date.now(),
+                        monotonicRttMs: performance.now() - sentMono,
+                        pollId,
+                    },
                     enumerable: false,
                 });
             }

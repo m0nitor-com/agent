@@ -61,14 +61,19 @@ export class ClockSync {
      * @param {number} sentAtMs local time the request was sent
      * @param {number} receivedAtMs local time the response arrived
      */
-    observe(serverTimeMs, sentAtMs, receivedAtMs) {
+    observe(serverTimeMs, sentAtMs, receivedAtMs, monotonicRttMs = receivedAtMs - sentAtMs) {
         // A jump during the request makes this round trip worthless as well.
         if (this.detectStep()) return false;
         if (!Number.isFinite(serverTimeMs) || serverTimeMs <= 0) return false;
-        const rtt = receivedAtMs - sentAtMs;
+        // The round trip comes from the monotonic clock and the midpoint is
+        // counted back from the arrival: a jump during the request that an
+        // earlier look already caught (detectStep() above then saw nothing)
+        // neither stretches the round trip nor mixes the old clock into the
+        // offset, which is measured against the clock as it is now.
+        const rtt = monotonicRttMs;
         if (!(rtt >= 0) || rtt > this.maxRttMs) return false;
 
-        const sample = serverTimeMs - (sentAtMs + rtt / 2);
+        const sample = serverTimeMs - (receivedAtMs - rtt / 2);
         this.lastRttMs = rtt;
         if (this.samples === 0) {
             this.offsetMs = sample;

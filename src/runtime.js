@@ -342,12 +342,14 @@ export class AgentRuntime {
         }
         this.isPolling = true;
         this.state.lastPollAttemptAt = new Date();
+        let data = null;
+        let taken = false;
 
         try {
             // Non-blocking: refresh cached public egress IPs for the allowlist.
             this.egress.maybeRefresh(this.shutdownController.signal);
 
-            const data = await this.api.getChecks({
+            data = await this.api.getChecks({
                 signal: this.shutdownController.signal,
                 health: this.healthPayload(),
                 pushSubscribed: this.push?.subscribed === true,
@@ -360,7 +362,12 @@ export class AgentRuntime {
             this.state.consecutiveFailedPolls = 0;
             this.state.lastSuccessfulPollAt = new Date();
             if (data?.timing) {
-                this.clock.observe(Number(data.server_time), data.timing.sentAt, data.timing.receivedAt);
+                this.clock.observe(
+                    Number(data.server_time),
+                    data.timing.sentAt,
+                    data.timing.receivedAt,
+                    data.timing.monotonicRttMs,
+                );
             }
 
             this.applyRemoteBudgets(data.worker?.budgets);
@@ -396,9 +403,14 @@ export class AgentRuntime {
                     now.push(monitor);
                 }
             }
+            taken = true;
             if (now.length > 0) this.launch(now);
             return data.poll_after_ms || null;
         } catch (error) {
+            // An answer that arrived but was not taken up leaves its legs
+            // leased to this poll on the console. Named as given up, the next
+            // poll gets them back instead of waiting out the lease.
+            if (!taken && data?.timing?.pollId) this.api.rememberAbandonedPoll?.(data.timing.pollId);
             if (this.isShuttingDown || this.shutdownController.signal.aborted) return null;
             this.state.consecutiveFailedPolls++;
             this.state.lastPollErrorPersistent = PERSISTENT_POLL_STATUSES.has(error.response?.status);
