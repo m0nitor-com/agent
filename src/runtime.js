@@ -212,6 +212,7 @@ export class AgentRuntime {
             },
             logger: this.logger,
             version: this.version,
+            serverNow: () => (this.clock.samples > 0 ? this.clock.serverNow() : null),
         });
     }
 

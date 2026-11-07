@@ -5,6 +5,7 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { logger } from './logger.js';
+import { buildHealthHeader } from './health-header.js';
 import { config } from './config.js';
 import { randomBytes } from 'crypto';
 import {
@@ -167,11 +168,9 @@ class ApiClient {
      * Fetch monitors that need to be checked
      */
     async getChecks(options = {}) {
-        const health = options.health
-            ? Buffer.from(JSON.stringify(options.health)).toString('base64url')
-            : null;
+        const health = options.health ? buildHealthHeader(options.health) : null;
         const headers = {};
-        if (health) headers['X-Agent-Health'] = health.slice(0, 6000);
+        if (health) headers['X-Agent-Health'] = health;
         // A live push subscription replaces the fast poll the console would
         // otherwise ask for after a public check.
         if (options.pushSubscribed === true) headers['X-Agent-Push'] = 'subscribed';

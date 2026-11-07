@@ -1,12 +1,18 @@
 import { computeNextPollDelay } from './backoff.js';
 import {
     PUSH_ACTIVITY_TIMEOUT_MS,
+    PUSH_CLOSE_REASON_MAX_CHARS,
+    PUSH_ERROR_MAX_CHARS,
+    PUSH_LATENCY_WINDOW,
     PUSH_PONG_TIMEOUT_MS,
     PUSH_RECONNECT_BASE_MS,
     PUSH_RECONNECT_MAX_MS,
+    PUSH_RTT_INTERVAL_MS,
     PUSH_UNAVAILABLE_RETRY_MS,
+    PUSH_WAKE_DELAY_MAX_MS,
     PUSH_WORK_EVENT,
 } from './constants.js';
+import { LatencyWindow } from './latency-window.js';
 
 const SOCKET_OPEN = 1;
 
@@ -47,6 +53,8 @@ export class PushChannel {
         version = '',
         WebSocketImpl = globalThis.WebSocket,
         rng = Math.random,
+        serverNow = null,
+        now = () => performance.now(),
     }) {
         this.authorize = authorize;
         this.onWork = onWork;
@@ -55,6 +63,10 @@ export class PushChannel {
         this.version = version;
         this.WebSocketImpl = WebSocketImpl;
         this.rng = rng;
+        // Console clock in epoch ms, or null while the clock is not synced.
+        this.serverNow = serverNow;
+        // Monotonic clock for durations and ages.
+        this.now = now;
         this.target = null;
         this.signature = null;
         this.socket = null;
@@ -65,7 +77,22 @@ export class PushChannel {
         this.activityTimer = null;
         this.pongTimer = null;
         this.reconnectTimer = null;
-        this.counters = { connects: 0, wakes: 0 };
+        this.rttTimer = null;
+        this.counters = { connects: 0, disconnects: 0, wakes: 0 };
+        // The socket got its connection_established (it was really open).
+        this.established = false;
+        // Stamp of the one ping that waits for its pong (RTT and keepalive share it).
+        this.pingSentAt = null;
+        this.connectStartedAt = null;
+        this.subscribedAt = null;
+        this.subscribeMs = null;
+        this.lastClose = null;
+        this.lastError = null;
+        this.lastWakeAt = null;
+        this.rtt = new LatencyWindow(PUSH_LATENCY_WINDOW);
+        this.lastRttMs = null;
+        this.wakeDelay = new LatencyWindow(PUSH_LATENCY_WINDOW);
+        this.lastWakeDelayMs = null;
     }
 
     static supported(WebSocketImpl = globalThis.WebSocket) {
@@ -103,7 +130,44 @@ export class PushChannel {
     }
 
     get telemetry() {
-        return { state: this.state, ...this.counters };
+        const now = this.now();
+        const ageS = (at) => Math.max(0, Math.floor((now - at) / 1000));
+        const rttSamples = this.rtt.values.length;
+        const delaySamples = this.wakeDelay.values.length;
+        const rtt = rttSamples > 0 ? this.rtt.percentiles() : null;
+        const delay = delaySamples > 0 ? this.wakeDelay.percentiles() : null;
+        return {
+            state: this.state,
+            connects: this.counters.connects,
+            disconnects: this.counters.disconnects,
+            wakes: this.counters.wakes,
+            subscribed_for_s: this.subscribedAt === null ? null : ageS(this.subscribedAt),
+            subscribe_ms: this.subscribeMs,
+            rtt_ms: rtt && {
+                last: Math.round(this.lastRttMs),
+                p50: Math.round(rtt.p50),
+                p95: Math.round(rtt.p95),
+                max: Math.round(this.rtt.max()),
+                n: rttSamples,
+            },
+            wake_delay_ms: delay && {
+                last: Math.round(this.lastWakeDelayMs),
+                p50: Math.round(delay.p50),
+                p95: Math.round(delay.p95),
+                n: delaySamples,
+            },
+            last_close: this.lastClose && {
+                code: this.lastClose.code,
+                reason: this.lastClose.reason,
+                age_s: ageS(this.lastClose.at),
+            },
+            last_error: this.lastError,
+            last_wake_age_s: this.lastWakeAt === null ? null : ageS(this.lastWakeAt),
+        };
+    }
+
+    fail(reason) {
+        this.lastError = String(reason).slice(0, PUSH_ERROR_MAX_CHARS);
     }
 
     /** Applies the push block of a checks poll. Unchanged settings are a no-op. */
@@ -153,6 +217,7 @@ export class PushChannel {
             socket = new this.WebSocketImpl(this.url());
         } catch (error) {
             this.logger?.warn({ name: error?.name }, '[PUSH] Could not open the websocket');
+            this.fail('socket_open');
             this.setState('disconnected');
             this.scheduleReconnect();
             return;
@@ -160,15 +225,25 @@ export class PushChannel {
 
         this.socket = socket;
         this.counters.connects++;
+        this.connectStartedAt = this.now();
         this.setState('connecting');
         socket.addEventListener('message', (event) => {
             if (this.socket === socket) void this.handleMessage(event?.data);
         });
-        socket.addEventListener('close', () => {
-            if (this.socket === socket) this.drop();
+        socket.addEventListener('close', (event) => {
+            if (this.socket !== socket) return;
+            const code = Number(event?.code);
+            this.lastClose = {
+                code: Number.isInteger(code) ? code : null,
+                reason: String(event?.reason ?? '').slice(0, PUSH_CLOSE_REASON_MAX_CHARS),
+                at: this.now(),
+            };
+            this.drop();
         });
         // An error is always followed by a close event, which reconnects.
-        socket.addEventListener('error', () => {});
+        socket.addEventListener('error', () => {
+            if (this.socket === socket) this.fail('socket_error');
+        });
     }
 
     async handleMessage(raw) {
@@ -185,6 +260,7 @@ export class PushChannel {
 
         switch (message.event) {
             case 'pusher:connection_established': {
+                this.established = true;
                 const timeoutMs = Number(data.activity_timeout) * 1000;
                 if (timeoutMs > 0) {
                     this.activityTimeoutMs = Math.min(MAX_ACTIVITY_TIMEOUT_MS, Math.max(MIN_ACTIVITY_TIMEOUT_MS, timeoutMs));
@@ -196,6 +272,9 @@ export class PushChannel {
             case 'pusher_internal:subscription_succeeded':
                 if (message.channel === this.target?.channel) {
                     this.failures = 0;
+                    if (this.connectStartedAt !== null) {
+                        this.subscribeMs = Math.round(this.now() - this.connectStartedAt);
+                    }
                     this.setState('subscribed');
                 }
                 return;
@@ -203,17 +282,21 @@ export class PushChannel {
                 this.send({ event: 'pusher:pong', data: {} });
                 return;
             case 'pusher:pong':
+                this.recordPong();
                 return;
             case 'pusher:error':
                 this.handleServerError(Number(data.code));
                 return;
             case 'pusher:subscription_error':
+                this.fail('subscription_error');
                 this.logger?.warn({ status: Number(data.status) || undefined }, '[PUSH] Subscription refused, staying on polling');
                 this.drop(PUSH_UNAVAILABLE_RETRY_MS);
                 return;
             default:
                 if (message.event === PUSH_WORK_EVENT && message.channel === this.target?.channel) {
                     this.counters.wakes++;
+                    this.lastWakeAt = this.now();
+                    this.recordWakeDelay(data.sent_at);
                     this.onWork();
                 }
         }
@@ -225,6 +308,7 @@ export class PushChannel {
      */
     handleServerError(code) {
         if (!Number.isInteger(code)) return;
+        this.fail(`pusher_error_${code}`);
         if (code >= 4000 && code < 4100) {
             this.logger?.warn({ code }, '[PUSH] Console refused the connection, staying on polling');
             this.drop(PUSH_UNAVAILABLE_RETRY_MS);
@@ -253,6 +337,7 @@ export class PushChannel {
         } catch (error) {
             if (this.socket !== socket || this.stopped) return;
             const status = error?.response?.status;
+            this.fail(Number.isInteger(status) ? `auth_${status}` : 'auth_network');
             if (UNAVAILABLE_AUTH_STATUSES.has(status)) {
                 this.logger?.info({ status }, '[PUSH] Console refused push, staying on polling');
                 this.drop(PUSH_UNAVAILABLE_RETRY_MS);
@@ -279,14 +364,61 @@ export class PushChannel {
 
         this.activityTimer = setTimeout(() => {
             this.activityTimer = null;
-            this.send({ event: 'pusher:ping', data: {} });
+            this.sendPing();
             this.pongTimer = setTimeout(() => {
                 this.logger?.warn('[PUSH] No answer from the console, reconnecting');
+                this.fail('pong_timeout');
                 this.drop();
             }, PUSH_PONG_TIMEOUT_MS);
             this.pongTimer.unref?.();
         }, this.activityTimeoutMs);
         this.activityTimer.unref?.();
+    }
+
+    /**
+     * Sends a ping and, unless one is already waiting, stamps it for the RTT.
+     * A stamp older than the pong timeout belongs to a ping that got no
+     * answer; it is replaced so a later pong is not measured against it.
+     */
+    sendPing() {
+        const sent = this.send({ event: 'pusher:ping', data: {} });
+        const now = this.now();
+        if (sent && (this.pingSentAt === null || now - this.pingSentAt > PUSH_PONG_TIMEOUT_MS)) {
+            this.pingSentAt = now;
+        }
+        return sent;
+    }
+
+    recordPong() {
+        if (this.pingSentAt === null) return;
+        const rttMs = Math.max(0, this.now() - this.pingSentAt);
+        this.pingSentAt = null;
+        this.lastRttMs = rttMs;
+        this.rtt.push(rttMs);
+    }
+
+    /**
+     * Console send time (epoch ms) to arrival. Old consoles send no sent_at,
+     * and an unsynced clock has no server time to compare with.
+     */
+    recordWakeDelay(sentAt) {
+        if (typeof sentAt !== 'number' || !Number.isFinite(sentAt)) return;
+        const serverNow = this.serverNow?.();
+        if (typeof serverNow !== 'number' || !Number.isFinite(serverNow)) return;
+        const delayMs = Math.min(PUSH_WAKE_DELAY_MAX_MS, Math.max(0, serverNow - sentAt));
+        this.lastWakeDelayMs = delayMs;
+        this.wakeDelay.push(delayMs);
+    }
+
+    startRttTimer() {
+        this.stopRttTimer();
+        this.rttTimer = setInterval(() => this.sendPing(), PUSH_RTT_INTERVAL_MS);
+        this.rttTimer.unref?.();
+    }
+
+    stopRttTimer() {
+        clearInterval(this.rttTimer);
+        this.rttTimer = null;
     }
 
     send(message) {
@@ -301,6 +433,7 @@ export class PushChannel {
 
     /** Closes the current socket and reconnects after a backoff or a fixed delay. */
     drop(retryAfterMs = null) {
+        if (this.established) this.counters.disconnects++;
         this.closeSocket();
         if (this.stopped || !this.target) {
             this.setState('idle');
@@ -328,8 +461,11 @@ export class PushChannel {
     closeSocket() {
         clearTimeout(this.activityTimer);
         clearTimeout(this.pongTimer);
+        this.stopRttTimer();
         this.activityTimer = null;
         this.pongTimer = null;
+        this.pingSentAt = null;
+        this.established = false;
         const socket = this.socket;
         this.socket = null;
         if (!socket) return;
@@ -345,6 +481,13 @@ export class PushChannel {
         const wasSubscribed = this.state === 'subscribed';
         this.state = next;
         const isSubscribed = next === 'subscribed';
+        if (isSubscribed) {
+            this.subscribedAt = this.now();
+            this.startRttTimer();
+        } else {
+            this.subscribedAt = null;
+            this.stopRttTimer();
+        }
         if (wasSubscribed !== isSubscribed) this.onStateChange(isSubscribed);
     }
 }

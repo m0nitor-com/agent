@@ -89,6 +89,15 @@ export const PUSH_WORK_EVENT = 'work.available';
 export const PUSH_ACTIVITY_TIMEOUT_MS = 30_000;
 // After our ping, the server has this long to answer before we reconnect.
 export const PUSH_PONG_TIMEOUT_MS = 30_000;
+// While subscribed, one ping per interval measures the round trip.
+export const PUSH_RTT_INTERVAL_MS = 30_000;
+// Samples kept for the round trip and the wake delivery delay.
+export const PUSH_LATENCY_WINDOW = 120;
+// Wake delays outside this range are clock noise; clamped.
+export const PUSH_WAKE_DELAY_MAX_MS = 600_000;
+// Telemetry string limits.
+export const PUSH_CLOSE_REASON_MAX_CHARS = 80;
+export const PUSH_ERROR_MAX_CHARS = 40;
 export const PUSH_RECONNECT_BASE_MS = 1000;
 export const PUSH_RECONNECT_MAX_MS = 60_000;
 // The console refused push (disabled, wrong channel, unknown app): retry
@@ -120,6 +129,8 @@ export const SETTLE_LOG_SAMPLE_RATE = 50;
 export const DEFAULT_HEALTH_PORT = 8080;
 export const HEALTH_UNHEALTHY_AFTER_FAILED_POLLS = 3;
 export const HEALTH_RESPONSE_MAX_BYTES = 16 * 1024;
+// Longest X-Agent-Health header value; beyond this the console drops the snapshot.
+export const HEALTH_HEADER_MAX_CHARS = 6000;
 export const SHUTDOWN_FLUSH_TIMEOUT_MS = 5000;
 export const EVENT_LOOP_DELAY_RESOLUTION_MS = 20;
 

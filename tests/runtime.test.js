@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AgentRuntime } from '../src/runtime.js';
 import { CheckRegistry } from '../src/lib/check-registry.js';
+import { HEALTH_HEADER_MAX_CHARS } from '../src/lib/constants.js';
+import { buildHealthHeader } from '../src/lib/health-header.js';
 
 function baseConfig(overrides = {}) {
     return {
@@ -781,5 +783,106 @@ describe('AgentRuntime push channel', () => {
     it('can be switched off', () => {
         const { runtime } = pushRuntime(undefined, { authorizePush: vi.fn() }, { PUSH_ENABLED: false });
         expect(runtime.push).toBeNull();
+    });
+});
+
+describe('AgentRuntime push telemetry', () => {
+    function realPushRuntime() {
+        const registry = new CheckRegistry();
+        const api = {
+            getChecks: vi.fn().mockResolvedValue({ monitors: [] }),
+            getAdhocChecks: vi.fn().mockResolvedValue({ monitors: [] }),
+            authorizePush: vi.fn(),
+            close: vi.fn(),
+        };
+        const runtime = new AgentRuntime({
+            config: baseConfig(),
+            logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+            registry,
+            api,
+            resultQueue: {
+                submitBatch: vi.fn().mockResolvedValue(true),
+                flush: vi.fn().mockResolvedValue(true),
+                dropOldest: vi.fn().mockReturnValue(0),
+                size: 0,
+                telemetry: {
+                    size: 12,
+                    bytes: 48_213,
+                    processing: false,
+                    counters: {
+                        enqueued: 120_432,
+                        reported: 120_100,
+                        dropped: 12,
+                        retries: 31,
+                        rejected: 2,
+                        coalesced: 118_000,
+                    },
+                    last_successful_report: new Date().toISOString(),
+                    last_report_failure: new Date().toISOString(),
+                    retry_attempt: 0,
+                    next_retry_at: null,
+                },
+            },
+            version: '2.9.0',
+        });
+        return { runtime, api };
+    }
+
+    it('gives the push channel the console clock only once it is synced', async () => {
+        const { runtime } = realPushRuntime();
+        const serverNow = runtime.push.serverNow;
+        expect(serverNow()).toBeNull();
+
+        const now = Date.now();
+        runtime.clock.observe(now + 5000, now - 20, now, 20);
+        expect(runtime.clock.samples).toBeGreaterThan(0);
+        expect(serverNow()).toBeGreaterThan(now + 4000);
+
+        await runtime.shutdown('test');
+    });
+
+    it('keeps a fully populated health payload inside the header limit', async () => {
+        const { runtime } = realPushRuntime();
+        const now = Date.now();
+        runtime.clock.observe(now + 5000, now - 20, now, 20);
+        for (let i = 0; i < 2048; i++) runtime.startDelays.push((i * 7) % 900);
+        runtime.state.scheduledChecks = 4_812_345;
+        runtime.state.lateStarts = 1234;
+        runtime.state.totalChecks = 4_812_345;
+
+        const push = runtime.push;
+        push.state = 'subscribed';
+        push.counters = { connects: 14, disconnects: 13, wakes: 48_211 };
+        push.subscribedAt = push.now() - 86_400_000;
+        push.subscribeMs = 187;
+        for (let i = 0; i < 120; i++) {
+            push.rtt.push(18 + (i % 40));
+            push.wakeDelay.push(40 + ((i * 13) % 700));
+        }
+        push.lastRttMs = 23;
+        push.lastWakeDelayMs = 61;
+        push.lastClose = { code: 1006, reason: 'x'.repeat(80), at: push.now() - 3_600_000 };
+        push.lastError = 'pusher_error_4201';
+        push.lastWakeAt = push.now() - 4000;
+
+        const health = runtime.healthPayload();
+        const json = JSON.stringify(health);
+        const header = buildHealthHeader(health);
+
+        expect(health.push).toMatchObject({
+            state: 'subscribed',
+            connects: 14,
+            disconnects: 13,
+            wakes: 48_211,
+            subscribe_ms: 187,
+            rtt_ms: { n: 120 },
+            wake_delay_ms: { n: 120 },
+            last_close: { code: 1006 },
+            last_error: 'pusher_error_4201',
+        });
+        expect(header).toBe(Buffer.from(json).toString('base64url'));
+        expect(header.length).toBeLessThanOrEqual(HEALTH_HEADER_MAX_CHARS);
+
+        await runtime.shutdown('test');
     });
 });

@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PushChannel } from '../src/lib/push-channel.js';
 import {
     PUSH_PONG_TIMEOUT_MS,
+    PUSH_RTT_INTERVAL_MS,
     PUSH_UNAVAILABLE_RETRY_MS,
+    PUSH_WAKE_DELAY_MAX_MS,
 } from '../src/lib/constants.js';
 
 class FakeSocket {
@@ -241,5 +243,269 @@ describe('PushChannel', () => {
         channel.stop();
         channel.configure(CONFIG);
         expect(FakeSocket.instances).toHaveLength(0);
+    });
+});
+
+describe('PushChannel telemetry', () => {
+    function clocked(overrides = {}) {
+        const time = { ms: 1000 };
+        const created = createChannel({ now: () => time.ms, ...overrides });
+        return { ...created, time };
+    }
+
+    async function subscribe(channel, time, handshakeMs = 0) {
+        channel.configure(CONFIG);
+        const socket = FakeSocket.instances.at(-1);
+        await establish(socket);
+        time.ms += handshakeMs;
+        socket.receive('pusher_internal:subscription_succeeded', {}, CONFIG.channel);
+        return socket;
+    }
+
+    it('starts with an empty, fully shaped snapshot', () => {
+        const { channel } = clocked();
+        expect(channel.telemetry).toEqual({
+            state: 'idle',
+            connects: 0,
+            disconnects: 0,
+            wakes: 0,
+            subscribed_for_s: null,
+            subscribe_ms: null,
+            rtt_ms: null,
+            wake_delay_ms: null,
+            last_close: null,
+            last_error: null,
+            last_wake_age_s: null,
+        });
+    });
+
+    it('measures the round trip of a ping while subscribed', async () => {
+        vi.useFakeTimers();
+        const { channel, time } = clocked();
+        channel.configure(CONFIG);
+        const socket = FakeSocket.instances[0];
+        socket.receive('pusher:connection_established', { socket_id: '1.2', activity_timeout: 120 });
+        await vi.advanceTimersByTimeAsync(0);
+        socket.receive('pusher_internal:subscription_succeeded', {}, CONFIG.channel);
+
+        await vi.advanceTimersByTimeAsync(PUSH_RTT_INTERVAL_MS);
+        expect(socket.sent.filter((m) => m.event === 'pusher:ping')).toHaveLength(1);
+        time.ms += 42;
+        socket.receive('pusher:pong');
+        expect(channel.telemetry.rtt_ms).toEqual({ last: 42, p50: 42, p95: 42, max: 42, n: 1 });
+
+        await vi.advanceTimersByTimeAsync(PUSH_RTT_INTERVAL_MS);
+        time.ms += 100;
+        socket.receive('pusher:pong');
+        expect(channel.telemetry.rtt_ms).toEqual({ last: 100, p50: 42, p95: 100, max: 100, n: 2 });
+        channel.stop();
+    });
+
+    it('ignores a pong without a ping in flight', async () => {
+        const { channel, time } = clocked();
+        const socket = await subscribe(channel, time);
+        socket.receive('pusher:pong');
+        expect(channel.telemetry.rtt_ms).toBeNull();
+        channel.stop();
+    });
+
+    it('shares the in-flight stamp with the keepalive ping', async () => {
+        vi.useFakeTimers();
+        const { channel, time } = clocked();
+        channel.configure(CONFIG);
+        const socket = FakeSocket.instances[0];
+        socket.receive('pusher:connection_established', { socket_id: '1.2', activity_timeout: 30 });
+        await vi.advanceTimersByTimeAsync(0);
+        socket.receive('pusher_internal:subscription_succeeded', {}, CONFIG.channel);
+
+        await vi.advanceTimersByTimeAsync(PUSH_RTT_INTERVAL_MS);
+        time.ms += 10;
+        await vi.advanceTimersByTimeAsync(0);
+        expect(socket.sent.filter((m) => m.event === 'pusher:ping')).toHaveLength(2);
+
+        time.ms += 15;
+        socket.receive('pusher:pong');
+        expect(channel.telemetry.rtt_ms).toMatchObject({ last: 25, n: 1 });
+        socket.receive('pusher:pong');
+        expect(channel.telemetry.rtt_ms.n).toBe(1);
+        channel.stop();
+    });
+
+    it('stamps a keepalive ping only once while another is in flight', async () => {
+        const { channel, time } = clocked();
+        const socket = await subscribe(channel, time);
+
+        channel.sendPing();
+        const firstStamp = channel.pingSentAt;
+        time.ms += 500;
+        channel.sendPing();
+        expect(channel.pingSentAt).toBe(firstStamp);
+        expect(socket.sent.filter((m) => m.event === 'pusher:ping')).toHaveLength(2);
+
+        socket.receive('pusher:pong');
+        expect(channel.telemetry.rtt_ms).toMatchObject({ last: 500, n: 1 });
+        channel.stop();
+    });
+
+    it('restamps a ping whose pong never came', async () => {
+        const { channel, time } = clocked();
+        const socket = await subscribe(channel, time);
+
+        channel.sendPing();
+        time.ms += PUSH_PONG_TIMEOUT_MS + 1;
+        channel.sendPing();
+        time.ms += 30;
+        socket.receive('pusher:pong');
+        expect(channel.telemetry.rtt_ms).toMatchObject({ last: 30, n: 1 });
+        channel.stop();
+    });
+
+    it('still reconnects when a ping stays unanswered', async () => {
+        vi.useFakeTimers();
+        const { channel, time } = clocked();
+        const socket = await subscribe(channel, time);
+
+        await vi.advanceTimersByTimeAsync(30_000);
+        await vi.advanceTimersByTimeAsync(PUSH_PONG_TIMEOUT_MS);
+        expect(socket.closed).toBe(true);
+        expect(channel.state).toBe('disconnected');
+        expect(channel.telemetry).toMatchObject({ disconnects: 1, last_error: 'pong_timeout', rtt_ms: null });
+        expect(channel.pingSentAt).toBeNull();
+        channel.stop();
+    });
+
+    it('tracks subscribe time, subscription age and disconnects', async () => {
+        vi.useFakeTimers();
+        const { channel, time } = clocked();
+        const socket = await subscribe(channel, time, 85);
+        expect(channel.telemetry).toMatchObject({ subscribe_ms: 85, subscribed_for_s: 0, connects: 1 });
+
+        time.ms += 125_900;
+        expect(channel.telemetry.subscribed_for_s).toBe(125);
+
+        socket.serverClose();
+        expect(channel.telemetry).toMatchObject({ disconnects: 1, subscribed_for_s: null, state: 'disconnected' });
+        channel.stop();
+    });
+
+    it('does not count a socket that never opened as a disconnect', () => {
+        const { channel } = clocked();
+        channel.configure(CONFIG);
+        FakeSocket.instances[0].serverClose();
+        expect(channel.telemetry.disconnects).toBe(0);
+        channel.stop();
+    });
+
+    it('records the close code and a trimmed reason', async () => {
+        vi.useFakeTimers();
+        const { channel, time } = clocked();
+        const socket = await subscribe(channel, time);
+
+        time.ms += 7500;
+        socket.readyState = 3;
+        socket.emit('close', { code: 4201, reason: 'x'.repeat(200) });
+        time.ms += 3000;
+        expect(channel.telemetry.last_close).toEqual({ code: 4201, reason: 'x'.repeat(80), age_s: 3 });
+        channel.stop();
+    });
+
+    it('keeps a close without details as null code and empty reason', () => {
+        const { channel } = clocked();
+        channel.configure(CONFIG);
+        FakeSocket.instances[0].serverClose();
+        expect(channel.telemetry.last_close).toEqual({ code: null, reason: '', age_s: 0 });
+        channel.stop();
+    });
+
+    it('names the failure of an auth request', async () => {
+        vi.useFakeTimers();
+        const refused = Object.assign(new Error('Forbidden'), { response: { status: 403 } });
+        const forbidden = clocked({ authorize: vi.fn().mockRejectedValue(refused) });
+        forbidden.channel.configure(CONFIG);
+        FakeSocket.instances[0].receive('pusher:connection_established', { socket_id: '1.2' });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(forbidden.channel.telemetry.last_error).toBe('auth_403');
+        forbidden.channel.stop();
+
+        const down = clocked({ authorize: vi.fn().mockRejectedValue(new Error('socket hang up')) });
+        down.channel.configure(CONFIG);
+        FakeSocket.instances[1].receive('pusher:connection_established', { socket_id: '1.2' });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(down.channel.telemetry.last_error).toBe('auth_network');
+        down.channel.stop();
+    });
+
+    it('names server errors, refused subscriptions and socket errors', () => {
+        vi.useFakeTimers();
+        const { channel } = clocked();
+        channel.configure(CONFIG);
+        const socket = FakeSocket.instances[0];
+
+        socket.emit('error');
+        expect(channel.telemetry.last_error).toBe('socket_error');
+        socket.receive('pusher:subscription_error', { status: 403 });
+        expect(channel.telemetry.last_error).toBe('subscription_error');
+        channel.stop();
+
+        const other = clocked();
+        other.channel.configure(CONFIG);
+        FakeSocket.instances[1].receive('pusher:error', { code: 4201 });
+        expect(other.channel.telemetry.last_error).toBe('pusher_error_4201');
+        other.channel.stop();
+    });
+
+    it('measures the wake delivery delay against the console clock', async () => {
+        const serverNow = vi.fn(() => 1_700_000_000_250);
+        const { channel, onWork, time } = clocked({ serverNow });
+        const socket = await subscribe(channel, time);
+
+        socket.receive('work.available', { sent_at: 1_700_000_000_000 }, CONFIG.channel);
+        time.ms += 12_000;
+        expect(onWork).toHaveBeenCalledTimes(1);
+        expect(channel.telemetry.wake_delay_ms).toEqual({ last: 250, p50: 250, p95: 250, n: 1 });
+        expect(channel.telemetry.last_wake_age_s).toBe(12);
+        channel.stop();
+    });
+
+    it('accepts sent_at as a JSON string and clamps the delay', async () => {
+        let now = 1_700_000_000_100;
+        const { channel, time } = clocked({ serverNow: () => now });
+        const socket = await subscribe(channel, time);
+
+        const message = (data) => socket.emit('message', {
+            data: JSON.stringify({ event: 'work.available', channel: CONFIG.channel, data }),
+        });
+        message(JSON.stringify({ sent_at: 1_700_000_000_000 }));
+        expect(channel.telemetry.wake_delay_ms.last).toBe(100);
+
+        message(JSON.stringify({ sent_at: now + 5000 }));
+        expect(channel.telemetry.wake_delay_ms.last).toBe(0);
+
+        now += 10_000_000;
+        message(JSON.stringify({ sent_at: 1_700_000_000_000 }));
+        expect(channel.telemetry.wake_delay_ms).toMatchObject({ last: PUSH_WAKE_DELAY_MAX_MS, n: 3 });
+        channel.stop();
+    });
+
+    it('skips the delay for old consoles and an unsynced clock', async () => {
+        const unsynced = clocked({ serverNow: () => null });
+        const socket = await subscribe(unsynced.channel, unsynced.time);
+        socket.receive('work.available', { sent_at: 1_700_000_000_000 }, CONFIG.channel);
+        expect(unsynced.channel.telemetry).toMatchObject({ wakes: 1, wake_delay_ms: null });
+        unsynced.channel.stop();
+
+        const old = clocked({ serverNow: () => 1_700_000_000_000 });
+        const oldSocket = await subscribe(old.channel, old.time);
+        oldSocket.receive('work.available', [], CONFIG.channel);
+        oldSocket.receive('work.available', { sent_at: 'soon' }, CONFIG.channel);
+        expect(old.channel.telemetry).toMatchObject({ wakes: 2, wake_delay_ms: null });
+        expect(old.onWork).toHaveBeenCalledTimes(2);
+        old.channel.stop();
+
+        const bare = clocked();
+        const bareSocket = await subscribe(bare.channel, bare.time);
+        bareSocket.receive('work.available', { sent_at: 1 }, CONFIG.channel);
+        expect(bare.channel.telemetry.wake_delay_ms).toBeNull();
+        bare.channel.stop();
     });
 });

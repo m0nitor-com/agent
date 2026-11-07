@@ -9,6 +9,7 @@ vi.mock('../src/lib/logger.js', () => ({
 }));
 
 const { default: ApiClient } = await import('../src/lib/api.js');
+const { buildHealthHeader } = await import('../src/lib/health-header.js');
 
 describe('ApiClient', () => {
     let client;
@@ -129,6 +130,59 @@ describe('ApiClient', () => {
             await client.getChecks({ health: { status: 'ok' } });
             const headers = client.client.get.mock.calls[0][1].headers;
             expect(JSON.parse(Buffer.from(headers['X-Agent-Health'], 'base64url').toString())).toEqual({ status: 'ok' });
+        });
+
+        it('never cuts an oversized health payload into invalid data', async () => {
+            client.client.get = vi.fn().mockResolvedValue({ data: { monitors: [] } });
+            const health = {
+                status: 'ok',
+                version: '2.9.0',
+                contract_version: 3,
+                schedule: { pending: 3, started: 9, start_delay_ms: { p50: 1, p95: 2, p99: 3, samples: 4 } },
+                report_coalescer: { blob: 'c'.repeat(4000) },
+                budgets: { blob: 'b'.repeat(4000) },
+                governor: { paused: false, saturated: false, reduction_steps: 0, effective: { total: 4 }, blob: 'g'.repeat(2000) },
+                egress: { ipv4: '1.2.3.4' },
+                memory: { rss_bytes: 1234 },
+                event_loop: { mean_delay_ms: 1 },
+                push: { state: 'subscribed', last_close: { code: 1006, reason: 'r'.repeat(80), age_s: 5 } },
+            };
+
+            await client.getChecks({ health });
+            const header = client.client.get.mock.calls[0][1].headers['X-Agent-Health'];
+            expect(header.length).toBeLessThanOrEqual(6000);
+            const decoded = JSON.parse(Buffer.from(header, 'base64url').toString());
+            expect(decoded).toMatchObject({
+                status: 'ok',
+                version: '2.9.0',
+                contract_version: 3,
+                push: { state: 'subscribed' },
+                memory: { rss_bytes: 1234 },
+                event_loop: { mean_delay_ms: 1 },
+            });
+            expect(decoded.report_coalescer).toBeUndefined();
+            expect(decoded.budgets).toBeUndefined();
+        });
+
+        it('drops optional parts in order and keeps what still fits', () => {
+            const health = {
+                status: 'ok',
+                report_coalescer: { blob: 'c'.repeat(300) },
+                budgets: { total: 4 },
+                push: { state: 'subscribed', last_close: { code: 1 }, wake_delay_ms: { n: 1 }, rtt_ms: { n: 1 } },
+            };
+            const full = Buffer.from(JSON.stringify(health)).toString('base64url');
+            const withoutCoalescer = Buffer.from(JSON.stringify({ ...health, report_coalescer: undefined })).toString('base64url');
+
+            expect(buildHealthHeader(health, full.length)).toBe(full);
+            const trimmed = JSON.parse(Buffer.from(buildHealthHeader(health, withoutCoalescer.length), 'base64url').toString());
+            expect(trimmed.report_coalescer).toBeUndefined();
+            expect(trimmed.budgets).toEqual({ total: 4 });
+            expect(trimmed.push.last_close).toBeDefined();
+        });
+
+        it('sends no health header when even the core does not fit', () => {
+            expect(buildHealthHeader({ status: 'ok', version: 'v'.repeat(500) }, 100)).toBeNull();
         });
 
         it('sends a fresh send time and its own timeout with every attempt', async () => {
